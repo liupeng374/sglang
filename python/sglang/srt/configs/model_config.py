@@ -441,10 +441,8 @@ class ModelConfig:
             if n_group is not None:
                 self.hf_config.topk_group = n_group
 
-        # DeepSeek V4.1 adds compress ratios {1, 2} on top of window-only (0).
-        # Until the low-ratio compressed-KV path exists, bring-up runs every
-        # layer window-only: keep the true ratios aside and present zeros to
-        # the attention layers and the KV pool, which only know {0, 4, 128}.
+        # Bring-up: ratios 1/2 run window-only until a low-ratio compressed-KV
+        # path exists; the attention layers and KV pool only know {0, 4, 128}.
         if (
             getattr(self.hf_config, "model_type", None) == "deepseek_v4.1"
             and not envs.SGLANG_DSV41_BUILD_COMPRESSOR.get()

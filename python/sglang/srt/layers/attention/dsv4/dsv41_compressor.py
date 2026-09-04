@@ -1,19 +1,9 @@
 """Low-ratio (C1/C2) compressor for DeepSeek V4.1.
 
-sglang's `Compressor` (compressor.py) is a fused-fp4 module built only for the
-V4 C4 / C128 ratios; its weights (`wkv_gate`, `ape`) and its coupling to the
-paged compressed-KV pool do not match V4.1, which uses ratios {1, 2} and a
-plain `{norm, wkv, wgate}` compressor on the kv_source layers only.
-
-This module ports the reference implementation's Compressor math verbatim so the
-checkpoint weights load and the pooled latent is numerically correct. It is
-deliberately framework-light (owns no paged KV) -- the attention integration
-decides where the latent is cached. Optimization (fp4, paging, kernels) is a
-later step; this is the correctness-first path.
-
-Reference: pools `compress_ratio` consecutive tokens into one latent with a
-learned softmax gate. Ratio 1 is a plain projection (no gate, no pooling);
-ratio > 1 softmax-pools in fp32.
+sglang's `Compressor` (compressor.py) serves the V4 C4/C128 ratios with fused
+`wkv_gate` / `ape` weights; V4.1 stores a plain `{norm, wkv, wgate}` compressor
+on the kv_source layers only. This module owns no paged KV: the attention
+integration decides where the pooled latent is cached.
 """
 
 from __future__ import annotations
@@ -42,10 +32,8 @@ class DeepseekV41Compressor(nn.Module):
             )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """x: [num_tokens, hidden]; returns one pre-RoPE latent per compressed
-        group: [num_tokens // ratio, head_dim]. Prefill-shaped (contiguous, whole
-        groups); decode-step accumulation is handled by the attention integration.
-        """
+        # x: [num_tokens, hidden] -> [num_tokens // ratio, head_dim], pre-RoPE;
+        # whole groups only, decode-step accumulation belongs to the caller.
         ratio = self.compress_ratio
         if ratio == 1:  # one token per group: no pooling, no gate, no fp32
             return self.norm(self.wkv(x))

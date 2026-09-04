@@ -685,10 +685,8 @@ class MqaAttentionBase(nn.Module):
             if compress_ratio is not None
             else config.compress_ratios[layer_id]
         )
-        # DeepSeek V4.1 uses low compress ratios {1, 2} instead of the V4
-        # {4, 128}. Window-only bring-up: without a real low-ratio compressed-KV
-        # path, treat {1, 2} as pure SWA (ratio 0) so the C4/C128-only attention
-        # backend / KV pool do not choke; correct only for prompts <= window_size.
+        # Bring-up: V4.1 ratios 1/2 run window-only until a low-ratio
+        # compressed-KV path exists; correct only for prompts <= window_size.
         if (
             self.compress_ratio in (1, 2)
             and not envs.SGLANG_DSV41_BUILD_COMPRESSOR.get()
@@ -981,9 +979,8 @@ class MQALayer(MqaAttentionBase):
             and self.layer_id in getattr(config, "kv_source_layers", ())
             and envs.SGLANG_DSV41_BUILD_COMPRESSOR.get()
         ):
-            # DeepSeek V4.1: the low-ratio compressor lives only on the
-            # kv_source layers; consumer layers read the shared latent. Ports the
-            # reference C1/C2 pooling; framework-light for correctness-first.
+            # V4.1 stores the low-ratio compressor on the kv_source layers only;
+            # consumer layers read the shared latent.
             from sglang.srt.layers.attention.dsv4.dsv41_compressor import (
                 DeepseekV41Compressor,
             )
@@ -3861,11 +3858,8 @@ class DeepseekV4ForCausalLM(nn.Module):
                         num_hidden_layers=self.config.num_hidden_layers,
                     )
 
-                    # DeepSeek V4.1 bring-up (text-first): the checkpoint carries a
-                    # vision tower + aligner + image-span embeddings, the engram
-                    # n-gram tables and a vision routing bias, none of which have a
-                    # home in the text DeepseekV4 model yet. Skip them to load the
-                    # language model alone.
+                    # V4.1 checkpoint tensors with no module in the text model yet;
+                    # the per-group count is logged after loading.
                     skip_group = None
                     if not is_dsv41:
                         pass
@@ -4019,10 +4013,8 @@ class DeepseekV4ForCausalLM(nn.Module):
                                 and (name.rsplit(".", 2)[0] + ".wkv_gate.weight")
                                 in params_dict
                             ):
-                                # V4 fuses compressor wkv+wgate into one wkv_gate.
-                                # DeepSeek V4.1 keeps them separate, so it has no
-                                # wkv_gate param and falls through to normal
-                                # per-param loading below.
+                                # V4 fuses compressor wkv+wgate into wkv_gate; V4.1
+                                # keeps them separate and falls through to per-param loading.
                                 is_kv = name.endswith(".wkv.weight")
                                 is_wgate = name.endswith(".wgate.weight")
                                 assert is_kv != is_wgate
@@ -4201,9 +4193,8 @@ def _dequant_fp8(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
         torch.float32,
     ), f"expected fp8_e8m0fnu or float32, got {scale.dtype}"
 
-    # Block size is per-checkpoint: V4 uses 128x128, DeepSeek V4.1 uses 32x32
-    # (config weight_block_size). Derive it from the weight/scale shapes instead
-    # of hard-coding 128.
+    # Block size is per-checkpoint (V4 128x128, V4.1 32x32); take it from the
+    # weight/scale shapes.
     bn = weight.shape[0] // scale.shape[0]
     bk = weight.shape[1] // scale.shape[1]
     weight_f32 = rearrange(

@@ -164,10 +164,9 @@ try:
     class _DeepseekV4ConfigAlias(_HFDeepseekV3Config):
         model_type = "deepseek_v4"
 
-    # DeepSeek V4.1 reuses the V3 config schema. Route it through the V3
-    # alias rather than transformers' native deepseek_v4 config, whose
-    # __post_init__ maps compress_ratios -> layer_types over a fixed {0,4,128}
-    # set and KeyErrors on V4.1's low compress ratios.
+    # Not transformers' native deepseek_v4 config: its __post_init__ maps
+    # compress_ratios over a fixed {0, 4, 128} set and KeyErrors on V4.1's 1/2.
+    # Drop the alias once transformers ships a deepseek_v4.1 config.
     class _DeepseekV41ConfigAlias(_HFDeepseekV3Config):
         model_type = "deepseek_v4.1"
 
