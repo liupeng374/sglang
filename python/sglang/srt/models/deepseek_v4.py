@@ -3810,6 +3810,9 @@ class DeepseekV4ForCausalLM(nn.Module):
         fuse_wqa_wkv = envs.SGLANG_OPT_FUSE_WQA_WKV.get()
         cache_wqkv_a_weight: dict[str, dict[str, torch.Tensor]] = {}
         skipped_by_group: dict[str, int] = {}
+        # The skip list below is DeepSeek V4.1 only; V4 checkpoints must load
+        # every compressor / indexer tensor.
+        is_dsv41 = getattr(self.config, "model_type", None) == "deepseek_v4.1"
 
         def auto_weight_loader(module):
             return getattr(module, "weight_loader", default_weight_loader)
@@ -3864,7 +3867,9 @@ class DeepseekV4ForCausalLM(nn.Module):
                     # home in the text DeepseekV4 model yet. Skip them to load the
                     # language model alone.
                     skip_group = None
-                    if name.startswith(("vision.", "aligner.", "image_")):
+                    if not is_dsv41:
+                        pass
+                    elif name.startswith(("vision.", "aligner.", "image_")):
                         skip_group = "vision"
                     elif ".engram." in name:
                         skip_group = "engram"
