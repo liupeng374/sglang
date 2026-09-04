@@ -685,11 +685,24 @@ class MqaAttentionBase(nn.Module):
             if compress_ratio is not None
             else config.compress_ratios[layer_id]
         )
+        # DeepSeek V4.1 uses low compress ratios {1, 2} instead of the V4
+        # {4, 128}. Window-only bring-up: without a real low-ratio compressed-KV
+        # path, treat {1, 2} as pure SWA (ratio 0) so the C4/C128-only attention
+        # backend / KV pool do not choke; correct only for prompts <= window_size.
+        if (
+            self.compress_ratio in (1, 2)
+            and not envs.SGLANG_DSV41_BUILD_COMPRESSOR.get()
+        ):
+            self.compress_ratio = 0
         assert self.compress_ratio in (
             0,
+            1,
+            2,
             4,
             128,
-        ), f"V4 compress_ratio: expected one of (0, 4, 128), got {self.compress_ratio}"
+        ), (
+            f"compress_ratio: expected one of (0, 1, 2, 4, 128), got {self.compress_ratio}"
+        )
 
         assert self.head_dim == config.head_dim
         assert config.num_key_value_heads == 1
@@ -963,6 +976,24 @@ class MQALayer(MqaAttentionBase):
                     fp4_cos=(self.cos_cache[:, 0, 0, :] if _is_hip else None),
                     fp4_sin=(self.sin_cache[:, 0, 0, :] if _is_hip else None),
                 )
+        elif (
+            self.compress_ratio in (1, 2)
+            and self.layer_id in getattr(config, "kv_source_layers", ())
+            and envs.SGLANG_DSV41_BUILD_COMPRESSOR.get()
+        ):
+            # DeepSeek V4.1: the low-ratio compressor lives only on the
+            # kv_source layers; consumer layers read the shared latent. Ports the
+            # reference C1/C2 pooling; framework-light for correctness-first.
+            from sglang.srt.layers.attention.dsv4.dsv41_compressor import (
+                DeepseekV41Compressor,
+            )
+
+            self.compressor = DeepseekV41Compressor(
+                hidden_size=config.hidden_size,
+                head_dim=self.head_dim,
+                compress_ratio=self.compress_ratio,
+                eps=config.rms_norm_eps,
+            )
 
         self.attn_mqa = RadixAttention(
             self.n_local_heads,
@@ -3778,6 +3809,7 @@ class DeepseekV4ForCausalLM(nn.Module):
 
         fuse_wqa_wkv = envs.SGLANG_OPT_FUSE_WQA_WKV.get()
         cache_wqkv_a_weight: dict[str, dict[str, torch.Tensor]] = {}
+        skipped_by_group: dict[str, int] = {}
 
         def auto_weight_loader(module):
             return getattr(module, "weight_loader", default_weight_loader)
@@ -3825,6 +3857,28 @@ class DeepseekV4ForCausalLM(nn.Module):
                         is_nextn=is_nextn,
                         num_hidden_layers=self.config.num_hidden_layers,
                     )
+
+                    # DeepSeek V4.1 bring-up (text-first): the checkpoint carries a
+                    # vision tower + aligner + image-span embeddings, the engram
+                    # n-gram tables and a vision routing bias, none of which have a
+                    # home in the text DeepseekV4 model yet. Skip them to load the
+                    # language model alone.
+                    skip_group = None
+                    if name.startswith(("vision.", "aligner.", "image_")):
+                        skip_group = "vision"
+                    elif ".engram." in name:
+                        skip_group = "engram"
+                    elif name.endswith(".gate.e_score_correction_bias_vl"):
+                        skip_group = "gate.bias_vl"
+                    elif not envs.SGLANG_DSV41_BUILD_COMPRESSOR.get() and (
+                        ".compressor." in name or ".indexer." in name
+                    ):
+                        skip_group = "compressor/indexer"
+                    if skip_group is not None:
+                        skipped_by_group[skip_group] = (
+                            skipped_by_group.get(skip_group, 0) + 1
+                        )
+                        continue
 
                     layer_id = get_layer_id(name)
                     if (
@@ -3954,7 +4008,16 @@ class DeepseekV4ForCausalLM(nn.Module):
                                 or name == "lm_head.weight"
                             ) and not self.pp_group.is_last_rank:
                                 continue
-                            elif COMPRESSOR_PART in name and ".wkv_gate." not in name:
+                            elif (
+                                COMPRESSOR_PART in name
+                                and ".wkv_gate." not in name
+                                and (name.rsplit(".", 2)[0] + ".wkv_gate.weight")
+                                in params_dict
+                            ):
+                                # V4 fuses compressor wkv+wgate into one wkv_gate.
+                                # DeepSeek V4.1 keeps them separate, so it has no
+                                # wkv_gate param and falls through to normal
+                                # per-param loading below.
                                 is_kv = name.endswith(".wkv.weight")
                                 is_wgate = name.endswith(".wgate.weight")
                                 assert is_kv != is_wgate
@@ -4059,6 +4122,12 @@ class DeepseekV4ForCausalLM(nn.Module):
 
         assert len(cache_compressor_weight) == 0
         assert len(cache_wqkv_a_weight) == 0, cache_wqkv_a_weight.keys()
+        if skipped_by_group:
+            log_info_on_rank0(
+                logger,
+                "Skipped checkpoint tensors not wired yet: "
+                + ", ".join(f"{k}={v}" for k, v in sorted(skipped_by_group.items())),
+            )
         unloaded_params = params_dict.keys() - loaded_params
 
         skipped_checking_patterns = [
@@ -4127,8 +4196,13 @@ def _dequant_fp8(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
         torch.float32,
     ), f"expected fp8_e8m0fnu or float32, got {scale.dtype}"
 
+    # Block size is per-checkpoint: V4 uses 128x128, DeepSeek V4.1 uses 32x32
+    # (config weight_block_size). Derive it from the weight/scale shapes instead
+    # of hard-coding 128.
+    bn = weight.shape[0] // scale.shape[0]
+    bk = weight.shape[1] // scale.shape[1]
     weight_f32 = rearrange(
-        weight.float(), "(sn bn) (sk bk) -> sn bn sk bk", bn=128, bk=128
+        weight.float(), "(sn bn) (sk bk) -> sn bn sk bk", bn=bn, bk=bk
     )
     result = rearrange(
         weight_f32 * scale.float()[:, None, :, None], "sn bn sk bk -> (sn bn) (sk bk)"

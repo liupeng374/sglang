@@ -164,8 +164,16 @@ try:
     class _DeepseekV4ConfigAlias(_HFDeepseekV3Config):
         model_type = "deepseek_v4"
 
+    # DeepSeek V4.1 reuses the V3 config schema. Route it through the V3
+    # alias rather than transformers' native deepseek_v4 config, whose
+    # __post_init__ maps compress_ratios -> layer_types over a fixed {0,4,128}
+    # set and KeyErrors on V4.1's low compress ratios.
+    class _DeepseekV41ConfigAlias(_HFDeepseekV3Config):
+        model_type = "deepseek_v4.1"
+
     _CONFIG_REGISTRY["deepseek_v32"] = _DeepseekV32ConfigAlias
     _CONFIG_REGISTRY["deepseek_v4"] = _DeepseekV4ConfigAlias
+    _CONFIG_REGISTRY["deepseek_v4.1"] = _DeepseekV41ConfigAlias
 
     # For kimi_k25_eagle3
     class _KimiK2ConfigAlias(_HFDeepseekV3Config):

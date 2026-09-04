@@ -1376,6 +1376,9 @@ class Envs:
     SGLANG_DSV4_FP4_EXPERTS = EnvBool(True)
     # Set True to dequantize the FP4 experts to FP8 at runtime
     SGLANG_DSV4_FP4_DEQUANT = EnvBool(False)
+    # DeepSeek V4.1 bring-up: build the low-ratio (1/2) compressors on the
+    # kv_source layers and load their weights. Off = every layer window-only.
+    SGLANG_DSV41_BUILD_COMPRESSOR = EnvBool(False)
     # Flash-0731 also accepts "low"; the active profile is checkpoint-resolved.
     SGLANG_DSV4_REASONING_EFFORT = EnvStr("")
     # Quantize the SWA fp8 KV cache from bf16-rounded values (matches
