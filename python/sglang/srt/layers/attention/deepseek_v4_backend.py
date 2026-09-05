@@ -51,10 +51,8 @@ from sglang.srt.layers.attention.dsv4.compressor_v2 import (
     create_paged_compressor_data,
 )
 from sglang.srt.layers.attention.dsv4.dsv41_sparse import (
-    DSV41Runtime,
     last_token_per_request,
     rope_tail,
-    sparse_attention,
     token_req_indices,
 )
 from sglang.srt.layers.attention.dsv4.indexer import C4IndexerBackendMixin
@@ -162,6 +160,38 @@ def _create_flashmla_metadata():
     return flash_mla.get_mla_metadata()[0]
 
 
+def _low_ratio_compression_metadata(
+    compress_ratio: int, seq_lens_casual: torch.Tensor, raw_out_loc: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Ratio 1/2 counterpart of the triton c4/c128 metadata; a completed group's
+    latent lives at raw_out_loc // ratio, -1 for a token that completes none."""
+    num_write_tokens = raw_out_loc.shape[0]
+    completes_group = seq_lens_casual[:num_write_tokens] % compress_ratio == 0
+    out_loc = torch.where(
+        completes_group, raw_out_loc.to(torch.int64) // compress_ratio, -1
+    )
+    topk_lengths_clamp1 = (seq_lens_casual // compress_ratio).clamp_min(1)
+    return out_loc, topk_lengths_clamp1.to(torch.int32)
+
+
+def _low_ratio_sparse_buffers(
+    topk_lengths_clamp1: torch.Tensor, topk: int, is_prefill: bool
+) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    """Fixed-shape top-k buffers the index_source layers fill in place. The
+    extra_topk_length the kernel reads comes from positions, not from the indexer."""
+    sparse_topk_lengths = torch.clamp(topk_lengths_clamp1, max=topk)
+    page_indices = _pad_last_dim(
+        torch.full(
+            (topk_lengths_clamp1.size(0), topk),
+            -1,
+            dtype=torch.int32,
+            device=topk_lengths_clamp1.device,
+        )
+    )
+    raw_indices = torch.empty_like(page_indices) if is_prefill else None
+    return sparse_topk_lengths, page_indices, raw_indices
+
+
 def _create_dummy_paged_compress_data(compress_ratio: int):
     return None
 
@@ -186,7 +216,7 @@ class DSV4AttnMetadata:
     swa_page_indices: torch.Tensor
     swa_topk_lengths: torch.Tensor
 
-    c4_sparse_topk: int
+    index_topk: int
     # SWA KV-store write target (out_cache_loc translated to SWA space), computed
     # once per iteration in make_core_attn_metadata and read by the store path.
     swa_out_cache_loc: Optional[torch.Tensor] = None
@@ -201,7 +231,28 @@ class DSV4AttnMetadata:
     c128_page_indices: Optional[torch.Tensor] = None
     c128_topk_lengths_clamp1: Optional[torch.Tensor] = None
 
-    c1_flashmla_metadata: FlashMLASchedMeta = field(init=False, repr=False)
+    # Ratios 1 and 2 (DeepSeek V4.1): one latent per ratio tokens at slot
+    # raw_out_loc // ratio of the c1 / c2 pool, attended through the FlashMLA
+    # extra cache like c4. Fields stay None for ratios the model does not have.
+    low_ratios: Tuple[int, ...] = ()
+    c1_out_loc: Optional[torch.Tensor] = None
+    c1_topk_lengths_clamp1: Optional[torch.Tensor] = None
+    c1_sparse_topk_lengths: Optional[torch.Tensor] = field(init=False, default=None)
+    c1_sparse_page_indices: Optional[torch.Tensor] = field(init=False, default=None)
+    c1_sparse_raw_indices: Optional[torch.Tensor] = field(init=False, default=None)
+    c2_out_loc: Optional[torch.Tensor] = None
+    c2_topk_lengths_clamp1: Optional[torch.Tensor] = None
+    c2_sparse_topk_lengths: Optional[torch.Tensor] = field(init=False, default=None)
+    c2_sparse_page_indices: Optional[torch.Tensor] = field(init=False, default=None)
+    c2_sparse_raw_indices: Optional[torch.Tensor] = field(init=False, default=None)
+
+    c0_flashmla_metadata: FlashMLASchedMeta = field(init=False, repr=False)
+    c1_flashmla_metadata: Optional[FlashMLASchedMeta] = field(
+        init=False, default=None, repr=False
+    )
+    c2_flashmla_metadata: Optional[FlashMLASchedMeta] = field(
+        init=False, default=None, repr=False
+    )
     c4_flashmla_metadata: FlashMLASchedMeta = field(init=False, repr=False)
     c128_flashmla_metadata: FlashMLASchedMeta = field(init=False, repr=False)
 
@@ -209,9 +260,13 @@ class DSV4AttnMetadata:
     def positions(self) -> torch.Tensor:
         return self.positions_casual
 
-    def get_flashmla_metadata(self, compress_ratio: Literal[0, 4, 128]):
+    def get_flashmla_metadata(self, compress_ratio: Literal[0, 1, 2, 4, 128]):
         if compress_ratio == 0:
+            return self.c0_flashmla_metadata
+        elif compress_ratio == 1:
             return self.c1_flashmla_metadata
+        elif compress_ratio == 2:
+            return self.c2_flashmla_metadata
         elif compress_ratio == 4:
             return self.c4_flashmla_metadata
         elif compress_ratio == 128:
@@ -219,14 +274,47 @@ class DSV4AttnMetadata:
         else:
             raise ValueError(f"invalid {compress_ratio=}")
 
+    def sparse_page_indices(self, compress_ratio: Literal[1, 2, 4]) -> torch.Tensor:
+        """Top-k slots into the ratio's extra cache, -1 padded; the indexer fills them."""
+        if compress_ratio == 1:
+            return self.c1_sparse_page_indices
+        elif compress_ratio == 2:
+            return self.c2_sparse_page_indices
+        elif compress_ratio == 4:
+            return self.c4_sparse_page_indices
+        raise ValueError(f"invalid {compress_ratio=}")
+
+    def sparse_raw_indices(
+        self, compress_ratio: Literal[1, 2, 4]
+    ) -> Optional[torch.Tensor]:
+        """The same top-k as request-local compressed positions, for the sparse
+        prefill workspace; allocated for prefill metadata only."""
+        if compress_ratio == 1:
+            return self.c1_sparse_raw_indices
+        elif compress_ratio == 2:
+            return self.c2_sparse_raw_indices
+        elif compress_ratio == 4:
+            return self.c4_sparse_raw_indices
+        raise ValueError(f"invalid {compress_ratio=}")
+
+    def sparse_topk_lengths(self, compress_ratio: Literal[1, 2, 4]) -> torch.Tensor:
+        if compress_ratio == 1:
+            return self.c1_sparse_topk_lengths
+        elif compress_ratio == 2:
+            return self.c2_sparse_topk_lengths
+        elif compress_ratio == 4:
+            return self.c4_sparse_topk_lengths
+        raise ValueError(f"invalid {compress_ratio=}")
+
     def copy_(self, other: DSV4AttnMetadata) -> None:
         copy_metadata(
             src=other,
             dst=self,
             check_eq_fields=[
-                "c4_sparse_topk",
+                "index_topk",
                 "page_size",
                 "cuda_int32_kwargs",
+                "low_ratios",
             ],
             copy_fields=[
                 "raw_out_loc",
@@ -244,21 +332,34 @@ class DSV4AttnMetadata:
                 "c4_sparse_topk_lengths",
                 "c4_sparse_page_indices",
                 "c4_sparse_raw_indices",
+                "c1_out_loc",
+                "c1_topk_lengths_clamp1",
+                "c1_sparse_topk_lengths",
+                "c1_sparse_page_indices",
+                "c1_sparse_raw_indices",
+                "c2_out_loc",
+                "c2_topk_lengths_clamp1",
+                "c2_sparse_topk_lengths",
+                "c2_sparse_page_indices",
+                "c2_sparse_raw_indices",
             ],
             assign_fields=[
                 # Recomputed by the recorded init_forward_metadata_in_graph op
                 # each forward; not copied across replays.
                 "swa_out_cache_loc",
+                "c0_flashmla_metadata",
                 "c1_flashmla_metadata",
+                "c2_flashmla_metadata",
                 "c4_flashmla_metadata",
                 "c128_flashmla_metadata",
             ],
         )
 
     def refresh_for_breakable_cuda_graph_replay_(self, other: DSV4AttnMetadata) -> None:
-        assert self.c4_sparse_topk == other.c4_sparse_topk
+        assert self.index_topk == other.index_topk
         assert self.page_size == other.page_size
         assert self.cuda_int32_kwargs == other.cuda_int32_kwargs
+        assert self.low_ratios == other.low_ratios
 
         tensor_copy_fields = [
             "raw_out_loc",
@@ -269,6 +370,12 @@ class DSV4AttnMetadata:
             "c4_topk_lengths_raw",
             "c4_topk_lengths_clamp1",
             "c4_sparse_topk_lengths",
+            "c1_out_loc",
+            "c1_topk_lengths_clamp1",
+            "c1_sparse_topk_lengths",
+            "c2_out_loc",
+            "c2_topk_lengths_clamp1",
+            "c2_sparse_topk_lengths",
         ]
         reference_assign_fields = [
             "page_table",
@@ -276,7 +383,9 @@ class DSV4AttnMetadata:
             "swa_topk_lengths",
             "c128_page_indices",
             "c128_topk_lengths_clamp1",
+            "c0_flashmla_metadata",
             "c1_flashmla_metadata",
+            "c2_flashmla_metadata",
             "c4_flashmla_metadata",
             "c128_flashmla_metadata",
         ]
@@ -329,6 +438,19 @@ class DSV4AttnMetadata:
         self.c128_page_indices = _pad_last_dim(self.c128_page_indices)
         self.swa_page_indices = _pad_last_dim(self.swa_page_indices)
 
+        if 1 in self.low_ratios:
+            self.c1_out_loc, self.c1_topk_lengths_clamp1 = (
+                _low_ratio_compression_metadata(
+                    1, self.seq_lens_casual, self.raw_out_loc
+                )
+            )
+        if 2 in self.low_ratios:
+            self.c2_out_loc, self.c2_topk_lengths_clamp1 = (
+                _low_ratio_compression_metadata(
+                    2, self.seq_lens_casual, self.raw_out_loc
+                )
+            )
+
     # Cache-write locations stay in global logical order and are intentionally
     # excluded from CP reindexing.
     _CP_REINDEX_FIELDS = [
@@ -342,11 +464,18 @@ class DSV4AttnMetadata:
         "c128_page_indices",
         "c128_topk_lengths_clamp1",
     ]
+    # Same treatment, None for models without that compress ratio.
+    _CP_REINDEX_OPTIONAL_FIELDS = [
+        "c1_topk_lengths_clamp1",
+        "c2_topk_lengths_clamp1",
+    ]
     _CP_GLOBAL_FIELDS = [
         "raw_out_loc",
         "swa_out_cache_loc",
         "c4_out_loc",
         "c128_out_loc",
+        "c1_out_loc",
+        "c2_out_loc",
     ]
 
     def apply_cp_reindex(self, num_tokens: Optional[int] = None) -> None:
@@ -367,6 +496,10 @@ class DSV4AttnMetadata:
                 f"CP reindex: {field_name} is {type(val)}, expected Tensor"
             )
             setattr(self, field_name, val[idx].contiguous())
+        for field_name in self._CP_REINDEX_OPTIONAL_FIELDS:
+            val = getattr(self, field_name)
+            if val is not None:
+                setattr(self, field_name, val[idx].contiguous())
 
         for field_name in self._CP_REINDEX_FIELDS:
             val = getattr(self, field_name)
@@ -384,18 +517,16 @@ class DSV4AttnMetadata:
             )
 
     def init_flashmla_related(self, is_prefill: bool = False):
-        # c4_sparse_topk is set from model_config.index_topk per-model
-        # (small model: 512, large model: 1024).
-        assert self.c4_sparse_topk in (512, 1024), (
-            f"unexpected c4_sparse_topk={self.c4_sparse_topk}; "
+        assert self.index_topk in (512, 1024), (
+            f"unexpected index_topk={self.index_topk}; "
             "supported: 512 (small) or 1024 (large)"
         )
         assert self.c4_topk_lengths_clamp1 is not None
         self.c4_sparse_topk_lengths = torch.clamp(
-            self.c4_topk_lengths_clamp1, max=self.c4_sparse_topk
+            self.c4_topk_lengths_clamp1, max=self.index_topk
         )
         self.c4_sparse_page_indices = torch.full(
-            (self.c4_topk_lengths_clamp1.size(0), self.c4_sparse_topk),
+            (self.c4_topk_lengths_clamp1.size(0), self.index_topk),
             -1,
             dtype=torch.int32,
             device=self.c4_topk_lengths_clamp1.device,
@@ -403,9 +534,27 @@ class DSV4AttnMetadata:
         self.c4_sparse_page_indices = _pad_last_dim(self.c4_sparse_page_indices)
         if is_prefill:
             self.c4_sparse_raw_indices = torch.empty_like(self.c4_sparse_page_indices)
-        self.c1_flashmla_metadata = _create_flashmla_metadata()
+        self.c0_flashmla_metadata = _create_flashmla_metadata()
         self.c4_flashmla_metadata = _create_flashmla_metadata()
         self.c128_flashmla_metadata = _create_flashmla_metadata()
+        if 1 in self.low_ratios:
+            (
+                self.c1_sparse_topk_lengths,
+                self.c1_sparse_page_indices,
+                self.c1_sparse_raw_indices,
+            ) = _low_ratio_sparse_buffers(
+                self.c1_topk_lengths_clamp1, self.index_topk, is_prefill
+            )
+            self.c1_flashmla_metadata = _create_flashmla_metadata()
+        if 2 in self.low_ratios:
+            (
+                self.c2_sparse_topk_lengths,
+                self.c2_sparse_page_indices,
+                self.c2_sparse_raw_indices,
+            ) = _low_ratio_sparse_buffers(
+                self.c2_topk_lengths_clamp1, self.index_topk, is_prefill
+            )
+            self.c2_flashmla_metadata = _create_flashmla_metadata()
 
 
 @dataclass
@@ -567,11 +716,21 @@ class DeepseekV4AttnBackend(
         self.token_to_kv_pool: DeepSeekV4TokenToKVPool = model_runner.token_to_kv_pool
         self.hisparse_coordinator = model_runner.hisparse_coordinator
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
-        self.v41_runtime = DSV41Runtime()
+        self.low_ratios: Tuple[int, ...] = tuple(
+            ratio
+            for ratio, pool in (
+                (1, self.token_to_kv_pool.c1_kv_pool),
+                (2, self.token_to_kv_pool.c2_kv_pool),
+            )
+            if pool is not None
+        )
+        # Per-request candidate masks the candidate_source layer publishes for the
+        # index_source layers after it (torch indexer scratch).
+        self.candidate_masks: Optional[List[torch.Tensor]] = None
         self.MAX_SEQ_LEN_FOR_CAPTURE = self.req_to_token.shape[1]
 
         assert isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool)
-        self.c4_topk = getattr(
+        self.index_topk = getattr(
             model_runner.model_config.hf_text_config, "index_topk", C4_TOPK
         )
 
@@ -1632,9 +1791,13 @@ class DeepseekV4AttnBackend(
             metadata.core_attn_metadata, DSV4AttnMetadata
         ):
             core = metadata.core_attn_metadata
-            core.c1_flashmla_metadata = _create_flashmla_metadata()
+            core.c0_flashmla_metadata = _create_flashmla_metadata()
             core.c4_flashmla_metadata = _create_flashmla_metadata()
             core.c128_flashmla_metadata = _create_flashmla_metadata()
+            if 1 in core.low_ratios:
+                core.c1_flashmla_metadata = _create_flashmla_metadata()
+            if 2 in core.low_ratios:
+                core.c2_flashmla_metadata = _create_flashmla_metadata()
 
         # PREP_IN_CUDA_GRAPH=True: warmup upgraded raw->full on the host;
         # restore raw so capture re-runs the upgrade inside the graph.
@@ -1642,33 +1805,32 @@ class DeepseekV4AttnBackend(
         if current_raw is not None:
             self.forward_metadata = current_raw
 
-    # ---- DeepSeek V4.1 ratio 1/2 compressed attention, torch bring-up path ----
+    # ---- DeepSeek V4.1 ratio 1/2 compressor and indexer, torch bring-up path ----
 
-    def forward_v41_sources(
+    def forward_low_ratio_sources(
         self, *, layer, x, q_lora, positions, forward_batch: ForwardBatch
     ) -> None:
-        """Runs on every ratio 1/2 layer before its attention: a kv_source layer
-        pools and stores this step's latents (and index keys), an index_source
-        layer publishes the top-k latent slots the following layers attend to."""
+        """Runs on every ratio 1/2 layer before its attention; the metadata and
+        latents it writes are what the layers after it attend through."""
         if forward_batch.forward_mode.is_idle():
             return
         req = token_req_indices(forward_batch)
         pos = positions.to(torch.int64)
-        rt = self.v41_runtime
-        rt.req, rt.pos = req, pos
         if layer.compressor is not None:
-            self._v41_compress(layer, x, req, pos, forward_batch)
+            self._low_ratio_compress(layer, x, req, pos)
         if layer.indexer is not None:
-            self._v41_index_topk(layer, x, q_lora, req, pos)
+            self._low_ratio_index_topk(layer, x, q_lora, req, pos)
 
-    def _v41_compress(self, layer, x, req, pos, forward_batch: ForwardBatch) -> None:
+    def _low_ratio_compress(self, layer, x, req, pos) -> None:
         pool = self.token_to_kv_pool
+        core = self.forward_metadata.core_metadata
         ratio = layer.compress_ratio
         kv, score = layer.compressor.project(x)
         if ratio == 1:
             group_mask = torch.ones_like(pos, dtype=torch.bool)
             group_pos = pos
             pooled = kv
+            out_loc = core.c1_out_loc
         else:
             odd = pos % 2 == 1
             paired_in_batch = torch.zeros_like(odd)
@@ -1678,8 +1840,8 @@ class DeepseekV4AttnBackend(
             idx = (odd & paired_in_batch).nonzero().squeeze(1)
             kv_partner[idx] = kv[idx - 1]
             score_partner[idx] = score[idx - 1]
-            state_kv = pool.v41_state_kv[layer.layer_id]
-            state_score = pool.v41_state_score[layer.layer_id]
+            state_kv = pool.c2_pair_kv_state[layer.layer_id]
+            state_score = pool.c2_pair_score_state[layer.layer_id]
             idx = (odd & ~paired_in_batch).nonzero().squeeze(1)
             kv_partner[idx] = state_kv[req[idx]]
             score_partner[idx] = state_score[req[idx]]
@@ -1693,40 +1855,44 @@ class DeepseekV4AttnBackend(
                 torch.stack([kv_partner[odd], kv[odd]], dim=1),
                 torch.stack([score_partner[odd], score[odd]], dim=1),
             )
+            out_loc = core.c2_out_loc
         if not bool(group_mask.any()):
             return
         latent = layer.compressor.finish(pooled)
-        slots = forward_batch.out_cache_loc.to(torch.int64)[group_mask] // ratio
+        slots = out_loc[group_mask]
         freqs = layer.freqs_cis[group_pos]
         # Index keys come from the pre-RoPE latent, so publish them first.
         if layer.indexer is not None and layer.indexer.owns_k:
-            pool.v41_index_k[layer.layer_id][slots] = layer.indexer.index_keys(
+            pool.source_index_k[layer.layer_id][slots] = layer.indexer.index_keys(
                 latent, freqs
             )
+        # The reference keeps the latent on the fp4 grid; the fp8 layout of the
+        # pool stores those values exactly.
         latent = fake_quant_fp4(rope_tail(latent, freqs, layer.rope_head_dim))
-        pool.v41_kv[layer.layer_id][slots] = latent
+        pool.set_extra_key_buffer_fused(
+            layer_id=layer.layer_id, loc=slots, cache_k=latent
+        )
 
-    def _v41_index_topk(self, layer, x, q_lora, req, pos) -> None:
+    def _low_ratio_index_topk(self, layer, x, q_lora, req, pos) -> None:
         pool = self.token_to_kv_pool
+        core = self.forward_metadata.core_metadata
         ratio = layer.compress_ratio
         indexer = layer.indexer
-        source = pool.v41_source_layer(layer.layer_id)
-        index_k_pool = pool.v41_index_k[source]
-        pad_slot = pool.v41_pad_slot(source)
+        index_k = pool.source_index_k[pool.latent_source_layer(layer.layer_id)]
+        # Same contract as the c4 indexer kernel: -1 padded slots, and the valid
+        # prefix of every row is exactly sparse_topk_lengths long.
+        page_indices = core.sparse_page_indices(ratio)
+        raw_indices = core.sparse_raw_indices(ratio)
+        page_indices.fill_(-1)
+        if raw_indices is not None:
+            raw_indices.fill_(-1)
         q = indexer.queries(q_lora, layer.freqs_cis[pos])
         weights = indexer.head_weights(x)
         # A compressed position is visible once the query has passed its last token.
         compress_lens = (pos + 1) // ratio
-        num_tokens = pos.shape[0]
         topk = indexer.index_topk
-        topk_slots = torch.full(
-            (num_tokens, topk), pad_slot, dtype=torch.int64, device=pos.device
-        )
-        topk_valid = torch.zeros(
-            (num_tokens, topk), dtype=torch.bool, device=pos.device
-        )
         publish = [] if indexer.is_candidate_source else None
-        consume = self.v41_runtime.candidates if indexer.uses_candidates else None
+        consume = self.candidate_masks if indexer.uses_candidates else None
         for b, r in enumerate(torch.unique_consecutive(req).tolist()):
             tok = (req == r).nonzero().squeeze(1)
             lens = compress_lens[tok]
@@ -1735,7 +1901,7 @@ class DeepseekV4AttnBackend(
                 continue
             j = torch.arange(lc, device=pos.device)
             slots_j = self.req_to_token[r, j * ratio].to(torch.int64) // ratio
-            s = indexer.scores(q[tok], index_k_pool[slots_j], weights[tok])
+            s = indexer.scores(q[tok], index_k[slots_j], weights[tok])
             s = s.masked_fill(j[None, :] >= lens[:, None], -torch.inf)
             if publish is not None:
                 publish.append(
@@ -1751,45 +1917,11 @@ class DeepseekV4AttnBackend(
             k = min(topk, lc)
             idx = s.topk(k, dim=-1, sorted=False).indices.sort(dim=-1).values
             reach = idx < lens[:, None]
-            topk_slots[tok, :k] = torch.where(reach, slots_j[idx], pad_slot)
-            topk_valid[tok, :k] = reach
-        self.v41_runtime.topk_slots = topk_slots
-        self.v41_runtime.topk_valid = topk_valid
+            page_indices[tok, :k] = torch.where(reach, slots_j[idx], -1).to(torch.int32)
+            if raw_indices is not None:
+                raw_indices[tok, :k] = torch.where(reach, idx, -1).to(torch.int32)
         if publish is not None:
-            self.v41_runtime.candidates = publish
-
-    def _forward_v41_attention(self, q, layer, attn_sink) -> torch.Tensor:
-        """Window K from the SWA cache plus the published top-k latents, in one
-        torch sparse attention."""
-        pool = self.token_to_kv_pool
-        rt = self.v41_runtime
-        assert rt.topk_slots is not None, "no index_source layer ran before this layer"
-        num_tokens = q.shape[0]
-        num_heads = layer.tp_q_head_num
-        q = q[:, :num_heads, :]
-        # The model window (SWA_WINDOW) is narrower than the SWA ring; translate
-        # each window position full kv id -> SWA cache id, the token-id space that
-        # dequantize_k_cache_paged reads, and dequantize with the ring's page size.
-        window = SWA_WINDOW
-        req, pos = rt.req, rt.pos
-        win_pos = (
-            pos[:, None] - (window - 1) + torch.arange(window, device=q.device)[None, :]
-        )
-        win_valid = win_pos >= 0
-        full_ids = self.req_to_token[
-            req[:, None].expand(-1, window), win_pos.clamp_min(0)
-        ]
-        swa_ids = pool.full_to_swa_index_mapping[full_ids.to(torch.int64)]
-        win_k = dequantize_k_cache_paged(
-            pool.get_swa_key_buffer_radix(layer.layer_id),
-            swa_ids.reshape(-1).to(torch.int32),
-            pool.swa_kv_pool.page_size,
-        ).view(num_tokens, window, -1)
-        source = pool.v41_source_layer(layer.layer_id)
-        comp_k = pool.v41_kv[source][rt.topk_slots]
-        k = torch.cat([win_k, comp_k], dim=1)
-        valid = torch.cat([win_valid, rt.topk_valid], dim=1)
-        return sparse_attention(q, k, valid, attn_sink[:num_heads], self.softmax_scale)
+            self.candidate_masks = publish
 
     def get_swa_out_cache_loc(self, forward_batch: ForwardBatch) -> torch.Tensor:
         """Resolve the SWA KV-store write target for the current forward.
@@ -1831,7 +1963,7 @@ class DeepseekV4AttnBackend(
         v: torch.Tensor,
         layer: RadixAttention,
         forward_batch: ForwardBatch,
-        compress_ratio: Literal[0, 4, 128],
+        compress_ratio: Literal[0, 1, 2, 4, 128],
         save_kv_cache: bool = True,
         attn_sink: Optional[torch.Tensor] = None,
         **_,
@@ -1853,14 +1985,13 @@ class DeepseekV4AttnBackend(
                 self.store_cache(layer_id, swa_k, forward_batch)
             swa_k_cache = token_to_kv_pool.get_swa_key_buffer_radix(layer_id)
 
-            if compress_ratio in (1, 2):
-                return self._forward_v41_attention(q, layer, attn_sink)
-
             extra_k_cache, extra_indices, extra_topk_lengths = None, None, None
-            if compress_ratio == 4:
+            if compress_ratio in (1, 2, 4):
                 extra_k_cache = token_to_kv_pool.get_extra_key_buffer(layer_id)
-                extra_indices = core_attn_metadata.c4_sparse_page_indices
-                extra_topk_lengths = core_attn_metadata.c4_sparse_topk_lengths
+                extra_indices = core_attn_metadata.sparse_page_indices(compress_ratio)
+                extra_topk_lengths = core_attn_metadata.sparse_topk_lengths(
+                    compress_ratio
+                )
             elif compress_ratio == 128:
                 extra_k_cache = token_to_kv_pool.get_extra_key_buffer(layer_id)
                 extra_indices = core_attn_metadata.c128_page_indices
@@ -1874,15 +2005,12 @@ class DeepseekV4AttnBackend(
             )
 
             if extra_k_cache is not None:
-                page_sizes = {
-                    4: token_to_kv_pool.page_size // 4,
-                    128: token_to_kv_pool.page_size // 128,
-                }
+                extra_page_size = token_to_kv_pool.get_extra_key_page_size(layer_id)
                 extra_k_cache = extra_k_cache[
-                    :, : page_sizes[compress_ratio] * k_cache_total_dim
+                    :, : extra_page_size * k_cache_total_dim
                 ].view(
                     extra_k_cache.shape[0],
-                    page_sizes[compress_ratio],
+                    extra_page_size,
                     1,
                     k_cache_total_dim,
                 )
@@ -2010,7 +2138,7 @@ class DeepseekV4AttnBackend(
         self,
         q: torch.Tensor,
         layer_id: int,
-        compress_ratio: Literal[0, 4, 128],
+        compress_ratio: Literal[0, 1, 2, 4, 128],
         forward_batch: ForwardBatch,
         token_to_kv_pool: DeepSeekV4TokenToKVPool,
         core_attn_metadata: DSV4AttnMetadata,
@@ -2060,16 +2188,18 @@ class DeepseekV4AttnBackend(
                 combined_indices = cache.c128_combined_indices
                 combined_lens = cache.c128_combined_lens
             else:
-                assert core_attn_metadata.c4_sparse_raw_indices is not None, (
-                    "sparse-prefill c4 path requires c4_sparse_raw_indices "
-                    "(allocated in init_flashmla_related when is_prefill=True)"
+                raw_indices = core_attn_metadata.sparse_raw_indices(compress_ratio)
+                assert raw_indices is not None, (
+                    f"sparse-prefill c{compress_ratio} path requires the raw "
+                    "top-k indices (allocated in init_flashmla_related when "
+                    "is_prefill=True)"
                 )
-                cache.ensure_c4(core_attn_metadata.page_table, extra_page_size)
-                flat_token_ids = cache.c4_flat_token_ids
-                combined_indices, combined_lens = cache.combine_c4_layer(
-                    c4_sparse_raw_indices=core_attn_metadata.c4_sparse_raw_indices[
-                        : cache.num_qo_tokens
-                    ],
+                gather = cache.ensure_compressed(
+                    compress_ratio, core_attn_metadata.page_table, extra_page_size
+                )
+                flat_token_ids = gather.flat_token_ids
+                combined_indices, combined_lens = cache.combine_compressed(
+                    compress_ratio, raw_indices[: cache.num_qo_tokens]
                 )
             n_compressed = flat_token_ids.shape[0]
             workspace = self.sparse_prefill_workspace.get(
@@ -2160,7 +2290,7 @@ class DeepseekV4AttnBackend(
         self,
         q: torch.Tensor,
         layer_id: int,
-        compress_ratio: Literal[0, 4, 128],
+        compress_ratio: Literal[0, 1, 2, 4, 128],
         forward_batch: ForwardBatch,
         token_to_kv_pool: DeepSeekV4TokenToKVPool,
         core_attn_metadata: DSV4AttnMetadata,
@@ -2238,16 +2368,18 @@ class DeepseekV4AttnBackend(
                 combined_indices = cache.c128_combined_indices
                 combined_lens = cache.c128_combined_lens
             else:
-                assert core_attn_metadata.c4_sparse_raw_indices is not None, (
-                    "Q8KV8 sparse-prefill c4 path requires c4_sparse_raw_indices "
-                    "(allocated in init_flashmla_related when is_prefill=True)"
+                raw_indices = core_attn_metadata.sparse_raw_indices(compress_ratio)
+                assert raw_indices is not None, (
+                    f"Q8KV8 sparse-prefill c{compress_ratio} path requires the raw "
+                    "top-k indices (allocated in init_flashmla_related when "
+                    "is_prefill=True)"
                 )
-                cache.ensure_c4(core_attn_metadata.page_table, extra_page_size)
-                flat_token_ids = cache.c4_flat_token_ids
-                combined_indices, combined_lens = cache.combine_c4_layer(
-                    c4_sparse_raw_indices=core_attn_metadata.c4_sparse_raw_indices[
-                        : cache.num_qo_tokens
-                    ],
+                gather = cache.ensure_compressed(
+                    compress_ratio, core_attn_metadata.page_table, extra_page_size
+                )
+                flat_token_ids = gather.flat_token_ids
+                combined_indices, combined_lens = cache.combine_compressed(
+                    compress_ratio, raw_indices[: cache.num_qo_tokens]
                 )
 
             n_compressed = flat_token_ids.shape[0]
@@ -2421,7 +2553,8 @@ class DeepseekV4AttnBackend(
             page_table=page_table,
             swa_page_indices=swa_page_indices,
             swa_topk_lengths=swa_topk_lengths,
-            c4_sparse_topk=self.c4_topk,
+            index_topk=self.index_topk,
+            low_ratios=self.low_ratios,
         )
 
         if need_compress:
@@ -2431,7 +2564,7 @@ class DeepseekV4AttnBackend(
             core_attn_metadata.c4_sparse_topk_lengths = None
             core_attn_metadata.c4_sparse_page_indices = None
             core_attn_metadata.c4_sparse_raw_indices = None
-            core_attn_metadata.c1_flashmla_metadata = _create_flashmla_metadata()
+            core_attn_metadata.c0_flashmla_metadata = _create_flashmla_metadata()
             core_attn_metadata.c4_flashmla_metadata = None
             core_attn_metadata.c128_flashmla_metadata = None
         return core_attn_metadata

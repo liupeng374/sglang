@@ -437,7 +437,8 @@ class DeepSeekV4IndexerPool(KVCache):
 
 class DeepSeekV4LayerItem(NamedTuple):
     compress_ratio: Literal[0, 1, 2, 4, 128]
-    # Ratios 1/2: the global id of the kv_source layer whose latents this layer reads.
+    # Layer index inside compress_kv_pool. Ratios 1/2 share a pool layer across the
+    # kv_source layer that writes it and the layers that read it.
     compress_layer_id: int
     compress_kv_pool: Optional[DeepSeekV4SingleKVPool] = None
 
@@ -536,6 +537,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         online_mtp_max_draft_tokens: int = 0,
         num_req_slots: Optional[int] = None,
         kv_source_layers: Sequence[int] = (),
+        full_size: Optional[int] = None,
     ):
         super().__init__(
             swa_size,
@@ -700,10 +702,16 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         )
 
         self.kv_source_layers = list(kv_source_layers)
+        self._init_low_ratio_pools(
+            full_size=full_size,
+            page_size=page_size,
+            dtype=dtype,
+            device=device,
+            enable_memory_saver=enable_memory_saver,
+        )
         self._init_compressed_layer_mapping()
 
         self._init_paged_compress_states(enable_memory_saver)
-        self._init_v41_pools(enable_memory_saver)
 
     def get_unified_kv(self, layer_id: int) -> torch.Tensor:
         # Under HiCache the compressed region is loaded H->D per layer; wait for this
@@ -1021,73 +1029,91 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 )
                 c128_cnt += 1
             elif ratio in (1, 2):
+                source = self.latent_source_layer(idx)
                 self.layer_mapping[idx] = DeepSeekV4LayerItem(
                     compress_ratio=ratio,
-                    compress_layer_id=self._v41_source_of(idx),
+                    compress_layer_id=self.low_ratio_sources[ratio].index(source),
+                    compress_kv_pool=self.c1_kv_pool if ratio == 1 else self.c2_kv_pool,
                 )
             else:
                 raise ValueError(f"Unsupported compression ratio: {ratio}")
 
-    def _v41_source_of(self, layer_id: int) -> int:
-        """The nearest preceding kv_source layer with the same ratio."""
+    def latent_source_layer(self, layer_id: int) -> int:
+        """The nearest preceding kv_source layer with the same ratio; the layer
+        whose latents, index keys and pair state this layer reads."""
         ratio = self.compression_ratios[layer_id]
-        sources = [
-            l
-            for l in self.kv_source_layers
-            if l <= layer_id and self.compression_ratios[l] == ratio
-        ]
+        sources = [l for l in self.low_ratio_sources[ratio] if l <= layer_id]
         assert sources, f"layer {layer_id} (ratio {ratio}) has no kv_source layer"
         return max(sources)
 
-    def _init_v41_pools(self, enable_memory_saver: bool) -> None:
-        """Ratio 1/2 latents live in plain bf16 slot buffers owned by the source
-        layers: slot = full-pool token loc // ratio, last row is the zero pad slot.
-        Ratio 2 also keeps the pending (unpaired) token per request."""
-        del enable_memory_saver
-        self.v41_kv: dict[int, torch.Tensor] = {}
-        self.v41_index_k: dict[int, torch.Tensor] = {}
-        self.v41_state_kv: dict[int, torch.Tensor] = {}
-        self.v41_state_score: dict[int, torch.Tensor] = {}
-        full_size = self.c128_size * 128
+    def _init_low_ratio_pools(
+        self,
+        *,
+        full_size: Optional[int],
+        page_size: int,
+        dtype: torch.dtype,
+        device: str,
+        enable_memory_saver: bool,
+    ) -> None:
+        """One FlashMLA-layout pool per ratio: slot = full-pool token loc // ratio,
+        page = page_size // ratio rows, so its pages line up with the full pool's."""
+        stage = range(self._stage_start, self._stage_end)
+        self.low_ratio_sources: dict[int, List[int]] = {
+            ratio: [
+                l
+                for l in self.kv_source_layers
+                if l in stage and self.compression_ratios[l] == ratio
+            ]
+            for ratio in (1, 2)
+        }
+        self.c1_kv_pool: Optional[DeepSeekV4SingleKVPool] = None
+        self.c2_kv_pool: Optional[DeepSeekV4SingleKVPool] = None
+        self.source_index_k: dict[int, torch.Tensor] = {}
+        self.c2_pair_kv_state: dict[int, torch.Tensor] = {}
+        self.c2_pair_score_state: dict[int, torch.Tensor] = {}
+        if not any(self.low_ratio_sources.values()):
+            return
+        assert full_size is not None, "low compress ratios need the full pool size"
+        assert not self._unified_kv, "unified_kv has no low compress ratio layout"
+
         head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
-        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
-            for layer_id in self.kv_source_layers:
-                if not (self._stage_start <= layer_id < self._stage_end):
-                    continue
-                ratio = self.compression_ratios[layer_id]
-                if ratio not in (1, 2):
-                    continue
-                rows = full_size // ratio + 1
-                self.v41_kv[layer_id] = torch.zeros(
-                    rows, head_dim, dtype=torch.bfloat16, device=self.device
-                )
-                self.v41_index_k[layer_id] = torch.zeros(
-                    rows,
-                    self.indexer_head_dim,
-                    dtype=torch.bfloat16,
-                    device=self.device,
-                )
-                if ratio == 2:
-                    self.v41_state_kv[layer_id] = torch.zeros(
-                        self.num_req_slots,
-                        head_dim,
-                        dtype=torch.float32,
-                        device=self.device,
+        for ratio, sources in self.low_ratio_sources.items():
+            if not sources:
+                continue
+            pool = self._make_kv_pool(
+                size=full_size // ratio,
+                page_size=page_size // ratio,
+                dtype=dtype,
+                layer_num=len(sources),
+                device=device,
+                enable_memory_saver=enable_memory_saver,
+                global_page_size=page_size,
+            )
+            if ratio == 1:
+                self.c1_kv_pool = pool
+            else:
+                self.c2_kv_pool = pool
+            with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+                for layer_id in sources:
+                    self.source_index_k[layer_id] = torch.zeros(
+                        full_size // ratio,
+                        self.indexer_head_dim,
+                        dtype=torch.bfloat16,
+                        device=device,
                     )
-                    self.v41_state_score[layer_id] = torch.zeros(
-                        self.num_req_slots,
-                        head_dim,
-                        dtype=torch.float32,
-                        device=self.device,
-                    )
-
-    def v41_source_layer(self, layer_id: int) -> int:
-        item = self.layer_mapping[layer_id]
-        assert item is not None and item.compress_ratio in (1, 2)
-        return item.compress_layer_id
-
-    def v41_pad_slot(self, source_layer: int) -> int:
-        return self.v41_kv[source_layer].shape[0] - 1
+                    if ratio == 2:
+                        self.c2_pair_kv_state[layer_id] = torch.zeros(
+                            self.num_req_slots,
+                            head_dim,
+                            dtype=torch.float32,
+                            device=device,
+                        )
+                        self.c2_pair_score_state[layer_id] = torch.zeros(
+                            self.num_req_slots,
+                            head_dim,
+                            dtype=torch.float32,
+                            device=device,
+                        )
 
     def wait_layer_transfer(self, layer_id: int) -> None:
         if self.layer_transfer_counter is not None:

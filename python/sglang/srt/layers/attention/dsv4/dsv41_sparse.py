@@ -1,15 +1,15 @@
-"""DeepSeek V4.1 low-ratio sparse attention (compress ratios 1 and 2), torch path.
+"""DeepSeek V4.1 low-ratio (compress ratios 1 and 2) compressor and indexer, torch path.
 
 Only kv_source layers compress; the layers that follow with the same ratio read
 the source's latent pool. index_source layers score the shared latents and
-publish top-k latent slots that the following layers reuse. Everything here is
-plain torch for bring-up; the FlashMLA sparse kernels take over once the
-compression metadata is ratio-generic.
+publish the top-k slots that the following layers attend to through FlashMLA.
+The modules here are plain torch for bring-up; the attention itself already runs
+on the FlashMLA sparse kernels.
 """
 
 from __future__ import annotations
 
-from typing import List, Optional, Tuple
+from typing import Optional, Tuple
 
 import torch
 from torch import nn
@@ -21,20 +21,6 @@ from sglang.srt.layers.linear import ColumnParallelLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix
-
-
-class DSV41Runtime:
-    """What the source layers hand to the layers after them within one forward.
-    Layers run in order and every source writes before its consumers read."""
-
-    def __init__(self):
-        self.topk_slots: Optional[torch.Tensor] = None  # [T, topk] latent pool rows
-        self.topk_valid: Optional[torch.Tensor] = None  # [T, topk] bool
-        # Per-token request row and position of the current forward.
-        self.req: Optional[torch.Tensor] = None
-        self.pos: Optional[torch.Tensor] = None
-        # One bool mask per request, in batch request order, over compressed positions.
-        self.candidates: Optional[List[torch.Tensor]] = None
 
 
 def token_req_indices(forward_batch) -> torch.Tensor:
@@ -179,31 +165,3 @@ class DeepseekV41Indexer(nn.Module):
         if get_parallel().tp_size > 1:
             s = tensor_model_parallel_all_reduce(s)
         return s.float()
-
-
-def sparse_attention(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    valid: torch.Tensor,
-    attn_sink: torch.Tensor,
-    softmax_scale: float,
-    chunk: int = 512,
-) -> torch.Tensor:
-    """q [T, H, D], k [T, N, D] (one latent is both key and value), valid [T, N],
-    attn_sink [H] fp32 -> [T, H, D]. Probabilities round to bf16 before the value
-    sum, matching the reference kernel."""
-    T, H, _ = q.shape
-    outs = []
-    sink = attn_sink.float().view(1, H, 1)
-    for s in range(0, T, chunk):
-        e = min(s + chunk, T)
-        qs, ks = q[s:e].float(), k[s:e].float()
-        scores = torch.einsum("bhd,bnd->bhn", qs, ks) * softmax_scale
-        scores = scores.masked_fill(~valid[s:e, None, :], -torch.inf)
-        # A finite floor keeps a row with no valid slot at an all-zero output.
-        row_max = scores.amax(dim=-1, keepdim=True).clamp_min(-1e30)
-        probs = torch.exp(scores - row_max)
-        denom = probs.sum(dim=-1, keepdim=True) + torch.exp(sink - row_max)
-        out = torch.einsum("bhn,bnd->bhd", probs.to(q.dtype).float(), ks) / denom
-        outs.append(out.to(q.dtype))
-    return torch.cat(outs, dim=0)

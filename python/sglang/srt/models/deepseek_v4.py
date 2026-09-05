@@ -1655,7 +1655,7 @@ class MQALayer(MqaAttentionBase):
         del qkv_a
 
         if self.compress_ratio in (1, 2):
-            attn_backend.forward_v41_sources(
+            attn_backend.forward_low_ratio_sources(
                 layer=self,
                 x=x,
                 q_lora=q_lora,
