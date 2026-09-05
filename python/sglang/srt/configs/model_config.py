@@ -441,22 +441,6 @@ class ModelConfig:
             if n_group is not None:
                 self.hf_config.topk_group = n_group
 
-        # Bring-up: ratios 1/2 run window-only until a low-ratio compressed-KV
-        # path exists; the attention layers and KV pool only know {0, 4, 128}.
-        if (
-            getattr(self.hf_config, "model_type", None) == "deepseek_v4.1"
-            and not envs.SGLANG_DSV41_BUILD_COMPRESSOR.get()
-        ):
-            ratios = list(getattr(self.hf_config, "compress_ratios", None) or [])
-            if any(r in (1, 2) for r in ratios):
-                self.hf_config.dsv41_true_compress_ratios = ratios
-                self.hf_config.compress_ratios = [
-                    0 if r in (1, 2) else r for r in ratios
-                ]
-                logger.info(
-                    "DeepSeek V4.1 bring-up: compress ratios 1/2 run window-only (0)."
-                )
-
         # Handle hybrid NVFP4 moe (nvidia/DeepSeek-V4-Pro-NVFP4)
         self.nvfp4_moe_meta: Optional[dict] = None
         hybrid_quant_cfg = _quant_config_to_dict(

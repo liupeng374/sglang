@@ -50,6 +50,13 @@ from sglang.srt.layers.attention.dsv4.compressor_v2 import (
     FusedCompressMetadata,
     create_paged_compressor_data,
 )
+from sglang.srt.layers.attention.dsv4.dsv41_sparse import (
+    DSV41Runtime,
+    last_token_per_request,
+    rope_tail,
+    sparse_attention,
+    token_req_indices,
+)
 from sglang.srt.layers.attention.dsv4.indexer import C4IndexerBackendMixin
 from sglang.srt.layers.attention.dsv4.metadata import (
     _LARGE_INDEXER_QUERY_THRESHOLD,
@@ -67,6 +74,8 @@ from sglang.srt.layers.attention.verify_mask import (
     maybe_create_verify_mask,
 )
 from sglang.srt.layers.cp.utils import is_cp_v2_active
+from sglang.srt.layers.dsv41.indexer import select_candidate_blocks
+from sglang.srt.layers.dsv41.quant import fake_quant_fp4
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import (
@@ -558,6 +567,7 @@ class DeepseekV4AttnBackend(
         self.token_to_kv_pool: DeepSeekV4TokenToKVPool = model_runner.token_to_kv_pool
         self.hisparse_coordinator = model_runner.hisparse_coordinator
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
+        self.v41_runtime = DSV41Runtime()
         self.MAX_SEQ_LEN_FOR_CAPTURE = self.req_to_token.shape[1]
 
         assert isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool)
@@ -1632,6 +1642,155 @@ class DeepseekV4AttnBackend(
         if current_raw is not None:
             self.forward_metadata = current_raw
 
+    # ---- DeepSeek V4.1 ratio 1/2 compressed attention, torch bring-up path ----
+
+    def forward_v41_sources(
+        self, *, layer, x, q_lora, positions, forward_batch: ForwardBatch
+    ) -> None:
+        """Runs on every ratio 1/2 layer before its attention: a kv_source layer
+        pools and stores this step's latents (and index keys), an index_source
+        layer publishes the top-k latent slots the following layers attend to."""
+        if forward_batch.forward_mode.is_idle():
+            return
+        req = token_req_indices(forward_batch)
+        pos = positions.to(torch.int64)
+        rt = self.v41_runtime
+        rt.req, rt.pos = req, pos
+        if layer.compressor is not None:
+            self._v41_compress(layer, x, req, pos, forward_batch)
+        if layer.indexer is not None:
+            self._v41_index_topk(layer, x, q_lora, req, pos)
+
+    def _v41_compress(self, layer, x, req, pos, forward_batch: ForwardBatch) -> None:
+        pool = self.token_to_kv_pool
+        ratio = layer.compress_ratio
+        kv, score = layer.compressor.project(x)
+        if ratio == 1:
+            group_mask = torch.ones_like(pos, dtype=torch.bool)
+            group_pos = pos
+            pooled = kv
+        else:
+            odd = pos % 2 == 1
+            paired_in_batch = torch.zeros_like(odd)
+            paired_in_batch[1:] = (req[1:] == req[:-1]) & (pos[1:] == pos[:-1] + 1)
+            kv_partner = torch.empty_like(kv)
+            score_partner = torch.empty_like(score)
+            idx = (odd & paired_in_batch).nonzero().squeeze(1)
+            kv_partner[idx] = kv[idx - 1]
+            score_partner[idx] = score[idx - 1]
+            state_kv = pool.v41_state_kv[layer.layer_id]
+            state_score = pool.v41_state_score[layer.layer_id]
+            idx = (odd & ~paired_in_batch).nonzero().squeeze(1)
+            kv_partner[idx] = state_kv[req[idx]]
+            score_partner[idx] = state_score[req[idx]]
+            # The request's last even token waits in the state for its partner.
+            pending = last_token_per_request(~odd, req)
+            state_kv[req[pending]] = kv[pending]
+            state_score[req[pending]] = score[pending]
+            group_mask = odd
+            group_pos = pos[odd] - 1
+            pooled = layer.compressor.pool_pairs(
+                torch.stack([kv_partner[odd], kv[odd]], dim=1),
+                torch.stack([score_partner[odd], score[odd]], dim=1),
+            )
+        if not bool(group_mask.any()):
+            return
+        latent = layer.compressor.finish(pooled)
+        slots = forward_batch.out_cache_loc.to(torch.int64)[group_mask] // ratio
+        freqs = layer.freqs_cis[group_pos]
+        # Index keys come from the pre-RoPE latent, so publish them first.
+        if layer.indexer is not None and layer.indexer.owns_k:
+            pool.v41_index_k[layer.layer_id][slots] = layer.indexer.index_keys(
+                latent, freqs
+            )
+        latent = fake_quant_fp4(rope_tail(latent, freqs, layer.rope_head_dim))
+        pool.v41_kv[layer.layer_id][slots] = latent
+
+    def _v41_index_topk(self, layer, x, q_lora, req, pos) -> None:
+        pool = self.token_to_kv_pool
+        ratio = layer.compress_ratio
+        indexer = layer.indexer
+        source = pool.v41_source_layer(layer.layer_id)
+        index_k_pool = pool.v41_index_k[source]
+        pad_slot = pool.v41_pad_slot(source)
+        q = indexer.queries(q_lora, layer.freqs_cis[pos])
+        weights = indexer.head_weights(x)
+        # A compressed position is visible once the query has passed its last token.
+        compress_lens = (pos + 1) // ratio
+        num_tokens = pos.shape[0]
+        topk = indexer.index_topk
+        topk_slots = torch.full(
+            (num_tokens, topk), pad_slot, dtype=torch.int64, device=pos.device
+        )
+        topk_valid = torch.zeros(
+            (num_tokens, topk), dtype=torch.bool, device=pos.device
+        )
+        publish = [] if indexer.is_candidate_source else None
+        consume = self.v41_runtime.candidates if indexer.uses_candidates else None
+        for b, r in enumerate(torch.unique_consecutive(req).tolist()):
+            tok = (req == r).nonzero().squeeze(1)
+            lens = compress_lens[tok]
+            lc = int(lens.max().item())
+            if lc == 0:
+                continue
+            j = torch.arange(lc, device=pos.device)
+            slots_j = self.req_to_token[r, j * ratio].to(torch.int64) // ratio
+            s = indexer.scores(q[tok], index_k_pool[slots_j], weights[tok])
+            s = s.masked_fill(j[None, :] >= lens[:, None], -torch.inf)
+            if publish is not None:
+                publish.append(
+                    select_candidate_blocks(
+                        s,
+                        lens[:, None],
+                        topk_blocks=indexer.candidate_topk_blocks,
+                        block_size=indexer.candidate_block_size,
+                    )
+                )
+            elif consume is not None:
+                s = s.masked_fill(~consume[b], -torch.inf)
+            k = min(topk, lc)
+            idx = s.topk(k, dim=-1, sorted=False).indices.sort(dim=-1).values
+            reach = idx < lens[:, None]
+            topk_slots[tok, :k] = torch.where(reach, slots_j[idx], pad_slot)
+            topk_valid[tok, :k] = reach
+        self.v41_runtime.topk_slots = topk_slots
+        self.v41_runtime.topk_valid = topk_valid
+        if publish is not None:
+            self.v41_runtime.candidates = publish
+
+    def _forward_v41_attention(self, q, layer, attn_sink) -> torch.Tensor:
+        """Window K from the SWA cache plus the published top-k latents, in one
+        torch sparse attention."""
+        pool = self.token_to_kv_pool
+        rt = self.v41_runtime
+        assert rt.topk_slots is not None, "no index_source layer ran before this layer"
+        num_tokens = q.shape[0]
+        num_heads = layer.tp_q_head_num
+        q = q[:, :num_heads, :]
+        # The model window (SWA_WINDOW) is narrower than the SWA ring; translate
+        # each window position full kv id -> SWA cache id, the token-id space that
+        # dequantize_k_cache_paged reads, and dequantize with the ring's page size.
+        window = SWA_WINDOW
+        req, pos = rt.req, rt.pos
+        win_pos = (
+            pos[:, None] - (window - 1) + torch.arange(window, device=q.device)[None, :]
+        )
+        win_valid = win_pos >= 0
+        full_ids = self.req_to_token[
+            req[:, None].expand(-1, window), win_pos.clamp_min(0)
+        ]
+        swa_ids = pool.full_to_swa_index_mapping[full_ids.to(torch.int64)]
+        win_k = dequantize_k_cache_paged(
+            pool.get_swa_key_buffer_radix(layer.layer_id),
+            swa_ids.reshape(-1).to(torch.int32),
+            pool.swa_kv_pool.page_size,
+        ).view(num_tokens, window, -1)
+        source = pool.v41_source_layer(layer.layer_id)
+        comp_k = pool.v41_kv[source][rt.topk_slots]
+        k = torch.cat([win_k, comp_k], dim=1)
+        valid = torch.cat([win_valid, rt.topk_valid], dim=1)
+        return sparse_attention(q, k, valid, attn_sink[:num_heads], self.softmax_scale)
+
     def get_swa_out_cache_loc(self, forward_batch: ForwardBatch) -> torch.Tensor:
         """Resolve the SWA KV-store write target for the current forward.
 
@@ -1693,6 +1852,9 @@ class DeepseekV4AttnBackend(
             if save_kv_cache:
                 self.store_cache(layer_id, swa_k, forward_batch)
             swa_k_cache = token_to_kv_pool.get_swa_key_buffer_radix(layer_id)
+
+            if compress_ratio in (1, 2):
+                return self._forward_v41_attention(q, layer, attn_sink)
 
             extra_k_cache, extra_indices, extra_topk_lengths = None, None, None
             if compress_ratio == 4:
