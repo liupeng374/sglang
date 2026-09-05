@@ -91,6 +91,12 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
     is_dp_gatherv_active,
 )
+from sglang.srt.layers.engram import (
+    Engram,
+    EngramHasher,
+    EngramLayout,
+    build_engram_layout,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -1965,6 +1971,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         prefix: str = "",
         alt_streams: Optional[List[torch.cuda.Stream]] = None,
         compress_ratio_override: Optional[int] = None,
+        engram_layout: Optional[EngramLayout] = None,
     ) -> None:
         super().__init__()
         self.config = config
@@ -2026,6 +2033,15 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.hc_pre_from_prev_sublayer = config.hc_pre_from_prev_sublayer
         if self.hc_pre_from_prev_sublayer:
             self.use_fused_mhc_post_pre = False
+        self.engram = None
+        if engram_layout is not None and layer_id in engram_layout.layer_ids:
+            self.engram = Engram(
+                config,
+                layer_id,
+                engram_layout,
+                quant_config=quant_config,
+                prefix=add_prefix("engram", prefix),
+            )
         self._input_layernorm_weight_bf16 = None
         self._post_attention_layernorm_weight_bf16 = None
 
@@ -3042,6 +3058,7 @@ class DeepseekV4Model(nn.Module):
             if use_stream_pool
             else None
         )
+        self.engram_layout = build_engram_layout(config)
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
             lambda idx, prefix: DeepseekV4DecoderLayer(
@@ -3050,6 +3067,7 @@ class DeepseekV4Model(nn.Module):
                 quant_config=quant_config,
                 prefix=prefix,
                 alt_streams=self.alt_streams,
+                engram_layout=self.engram_layout,
             ),
             pp_rank=self.pp_group.rank_in_group,
             pp_size=self.pp_group.world_size,
@@ -3071,6 +3089,9 @@ class DeepseekV4Model(nn.Module):
                 self.hc_head_base,
                 self.hc_head_scale,
             ) = make_hc_head_params(hc_mult, config.hidden_size)
+        self.engram_hasher = None
+        if self.engram_layout is not None:
+            self.engram_hasher = EngramHasher.from_config(config, self.engram_layout)
 
         self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
         self.use_fused_mhc_post_pre = (
@@ -3131,8 +3152,16 @@ class DeepseekV4Model(nn.Module):
         dspark_aux_hidden_states: List[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         assert self.pp_group.world_size == 1, "pre-mix hand-off across PP is not wired"
+        hash_ids = None
+        if self.engram_hasher is not None:
+            hash_ids = self.engram_hasher(input_ids, forward_batch)
         prev_pre = None
         for i in range(self.start_layer, self.end_layer):
+            engram = self.layers[i].engram
+            if engram is not None:
+                hidden_states = engram(
+                    hidden_states, hash_ids[:, engram.layer_hash_index]
+                )
             if capture_dspark and i in self.dspark_layers_to_capture:
                 # The draft head reads the attention input of its target layers.
                 dspark_aux_hidden_states.append(hidden_states.mean(dim=1))
@@ -3855,6 +3884,8 @@ class DeepseekV4ForCausalLM(nn.Module):
 
         if "self_attn" in name and name.endswith(".scale"):
             name = name.removesuffix(".scale") + ".weight_scale_inv"
+        if ".engram.wkv." in name and name.endswith(".scale"):
+            name = name.removesuffix(".scale") + ".weight_scale_inv"
 
         name = name.replace(".gate.tid2eid", ".topk.tid2eid")
         name = name.replace(".gate.bias", ".gate.e_score_correction_bias")
@@ -4031,8 +4062,6 @@ class DeepseekV4ForCausalLM(nn.Module):
                         pass
                     elif name.startswith(("vision.", "aligner.", "image_")):
                         skip_group = "vision"
-                    elif ".engram." in name:
-                        skip_group = "engram"
                     elif name.endswith(".gate.e_score_correction_bias_vl"):
                         skip_group = "gate.bias_vl"
                     if skip_group is not None:
@@ -4211,6 +4240,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                             elif (
                                 fuse_wqa_wkv
                                 and ".compressor." not in name
+                                and ".engram." not in name
                                 and (
                                     name.endswith(".wq_a.weight")
                                     or name.endswith(".wq_a.weight_scale_inv")

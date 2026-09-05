@@ -171,6 +171,14 @@ try:
         candidate_source_layer = -1
         candidate_topk_blocks = 0
         candidate_block_size = 0
+        engram_layer_ids = ()
+        engram_num_embeddings = ()
+        engram_max_ngram_size = 1
+        engram_vocab_size = 0
+        engram_n_heads = 0
+        engram_head_dim = 0
+        engram_pad_id = 2
+        engram_compressed_vocab_size = 0
 
     # Not transformers' native deepseek_v4 config: its __post_init__ maps
     # compress_ratios over a fixed {0, 4, 128} set and KeyErrors on V4.1's 1/2.
@@ -182,6 +190,14 @@ try:
         # FFN's pre-mix instead of hc_head_* parameters.
         hc_pre_from_prev_sublayer = True
         q_head_norm = False
+        engram_layer_ids = ()
+        engram_num_embeddings = ()
+        engram_max_ngram_size = 1
+        engram_vocab_size = 0
+        engram_n_heads = 0
+        engram_head_dim = 0
+        engram_pad_id = 2
+        engram_compressed_vocab_size = 0
 
     _CONFIG_REGISTRY["deepseek_v32"] = _DeepseekV32ConfigAlias
     _CONFIG_REGISTRY["deepseek_v4"] = _DeepseekV4ConfigAlias

@@ -109,6 +109,15 @@ class DeepSeekV4Config(PretrainedConfig):
     candidate_topk_blocks: int = 0
     candidate_block_size: int = 0
 
+    engram_layer_ids: List[int] = field(default_factory=list)
+    engram_num_embeddings: List[int] = field(default_factory=list)
+    engram_max_ngram_size: int = 1
+    engram_vocab_size: int = 0
+    engram_n_heads: int = 0
+    engram_head_dim: int = 0
+    engram_pad_id: int = 2
+    engram_compressed_vocab_size: int = 0
+
     n_hash_layers: int = 3
     hc_mult: int = 4
     hc_pre_from_prev_sublayer: bool = False

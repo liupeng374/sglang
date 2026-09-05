@@ -94,12 +94,32 @@ class EngramLayout(msgspec.Struct, frozen=True):
         layer_ids = tuple(args.engram_layer_ids)
         if not layer_ids:
             return None
-        max_ngram_size, n_heads = args.engram_max_ngram_size, args.engram_n_heads
+        return cls.build(
+            layer_ids=layer_ids,
+            num_embeddings=tuple(args.engram_num_embeddings),
+            max_ngram_size=args.engram_max_ngram_size,
+            n_heads=args.engram_n_heads,
+            head_dim=args.engram_head_dim,
+            vocab_size=args.engram_vocab_size,
+        )
+
+    @classmethod
+    def build(
+        cls,
+        layer_ids: tuple[int, ...],
+        num_embeddings: tuple[int, ...],
+        max_ngram_size: int,
+        n_heads: int,
+        head_dim: int,
+        vocab_size: int,
+    ) -> "EngramLayout":
+        """Primes are drawn in (layer, n-gram size, head) order from one shared
+        ascending sequence starting above vocab_size - 1."""
         primes, seen = [], set()
         for _ in layer_ids:
             per_ngram = []
             for _ in range(max_ngram_size - 1):
-                sizes, current = [], args.engram_vocab_size - 1
+                sizes, current = [], vocab_size - 1
                 for _ in range(n_heads):
                     current = find_next_prime(current, seen)
                     seen.add(current)
@@ -109,10 +129,10 @@ class EngramLayout(msgspec.Struct, frozen=True):
         return cls(
             max_ngram_size=max_ngram_size,
             layer_ids=layer_ids,
-            num_embeddings=tuple(args.engram_num_embeddings),
+            num_embeddings=num_embeddings,
             primes=tuple(primes),
             n_heads=n_heads,
-            head_dim=args.engram_head_dim,
+            head_dim=head_dim,
         )
 
 
