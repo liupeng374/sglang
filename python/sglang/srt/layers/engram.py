@@ -22,6 +22,7 @@ from sglang.srt.layers.dsv41.engram import (
 from sglang.srt.layers.dsv41.quant import FP8_BLOCK_SIZE
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.managers.schedule_batch import MM_PAD_SHIFT_VALUE
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import get_model, get_parallel, get_serving
 from sglang.srt.utils import add_prefix
@@ -106,12 +107,18 @@ class EngramHasher(nn.Module):
             revision=get_model().revision,
             tokenizer_backend="huggingface",
         )
-        return cls(
+        result = cls(
             layout,
             tokenizer,
             config.engram_pad_id,
             config.engram_compressed_vocab_size,
         )
+        result.image_token_id = (
+            config.image_token_id
+            if config.model_type == "deepseek_v4.1" and config.vision_n_layers > 0
+            else None
+        )
+        return result
 
     def forward(
         self, input_ids: torch.Tensor, forward_batch: ForwardBatch
@@ -130,9 +137,22 @@ class EngramHasher(nn.Module):
             torch.int64
         )
         tokens[:, 0] = input_ids
+        blocked = lookback < 0
+        if self.image_token_id is not None:
+            # Previous chunks remain hashed in the scheduler's token table.
+            tokens = tokens.masked_fill(
+                tokens >= MM_PAD_SHIFT_VALUE, self.image_token_id
+            )
+            # Once a lookback hits an image, every older predecessor is PAD.
+            blocked = (
+                (blocked | (tokens == self.image_token_id))
+                .to(torch.int32)
+                .cummax(-1)
+                .values.bool()
+            )
         return compute_engram_hash_ids(
             tokens,
-            lookback < 0,
+            blocked,
             self.pad_id,
             self.token_map,
             self.multipliers,

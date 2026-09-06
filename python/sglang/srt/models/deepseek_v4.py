@@ -5,6 +5,7 @@ import functools
 import logging
 import time
 from contextlib import contextmanager, nullcontext
+from types import SimpleNamespace
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -91,6 +92,8 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
     is_dp_gatherv_active,
 )
+from sglang.srt.layers.dsv41.image_processor import image_token_types
+from sglang.srt.layers.dsv41.vision import Aligner, ViT
 from sglang.srt.layers.engram import (
     Engram,
     EngramHasher,
@@ -122,6 +125,11 @@ from sglang.srt.layers.utils.cp_utils import (
     prepare_context_parallel_metadata,
 )
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+from sglang.srt.managers.mm_utils import (
+    MultiModalityDataPaddingPatternMultimodalTokens,
+    embed_mm_inputs,
+)
+from sglang.srt.managers.schedule_batch import MM_PAD_SHIFT_VALUE, MultimodalInputs
 from sglang.srt.mem_cache.memory_pool import RadixAttention
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -169,6 +177,7 @@ from sglang.srt.models.deepseek_v2 import (
     _is_xpu,
 )
 from sglang.srt.runtime_context import (
+    get_server_args,
     get_device,
     get_exec,
     get_forward,
@@ -3022,6 +3031,7 @@ class DeepseekV4Model(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        self.config = config
         self.pp_group = get_pp_group()
         self.hidden_size = config.hidden_size
         if self.pp_group.is_first_rank:
@@ -3159,9 +3169,19 @@ class DeepseekV4Model(nn.Module):
         for i in range(self.start_layer, self.end_layer):
             engram = self.layers[i].engram
             if engram is not None:
+                before_engram = hidden_states
                 hidden_states = engram(
                     hidden_states, hash_ids[:, engram.layer_hash_index]
                 )
+                if (
+                    self.config.model_type == "deepseek_v4.1"
+                    and self.config.vision_n_layers > 0
+                ):
+                    hidden_states = torch.where(
+                        (input_ids == self.config.image_token_id)[:, None, None],
+                        before_engram,
+                        hidden_states,
+                    )
             if capture_dspark and i in self.dspark_layers_to_capture:
                 # The draft head reads the attention input of its target layers.
                 dspark_aux_hidden_states.append(hidden_states.mean(dim=1))
@@ -3606,6 +3626,29 @@ class DeepseekV4ForCausalLM(nn.Module):
         self.quant_config = quant_config
         self.wo_a_fp8 = wo_a_fp8_gemm_enabled(quant_config)
         self.determine_num_fused_shared_experts()
+        self.vision = None
+        if config.model_type == "deepseek_v4.1" and config.vision_n_layers > 0:
+            args = get_server_args()
+            if not args.disable_cuda_graph or not args.disable_radix_cache:
+                raise ValueError(
+                    "V4.1 vision currently requires --disable-cuda-graph --disable-radix-cache"
+                )
+            if (
+                get_parallel().attn_dp_size != 1
+                or get_parallel().attn_cp_size != 1
+                or get_pp_group().world_size != 1
+                or not get_moe_a2a_backend().is_none()
+            ):
+                raise ValueError(
+                    "V4.1 vision currently supports eager TP/EP without DP, CP, PP or MoE A2A"
+                )
+
+            args = SimpleNamespace(**vars(config), dim=config.hidden_size)
+            self.vision = ViT(args)
+            self.aligner = Aligner(args)
+            self.image_start = nn.Parameter(torch.empty(config.hidden_size))
+            self.image_end = nn.Parameter(torch.empty(config.hidden_size))
+            self.image_newline = nn.Parameter(torch.empty(config.hidden_size))
         self.model = DeepseekV4Model(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
@@ -3654,6 +3697,51 @@ class DeepseekV4ForCausalLM(nn.Module):
     @property
     def routed_experts_weights_of_layer(self):
         return self._routed_experts_weights_of_layer.value
+
+    def pad_input_ids(self, input_ids, mm_inputs):
+
+        return MultiModalityDataPaddingPatternMultimodalTokens().pad_input_tokens(
+            input_ids, mm_inputs
+        )
+
+    def get_image_feature(self, items):
+        """Return complete spans for the shared MM cache and chunk scheduler."""
+
+        spans = []
+        device, dtype = self.image_start.device, self.image_start.dtype
+        for item in items:
+            item.reconstruct(device.index, ipc_consumer_count=self.tp_size)
+            h, w = int(item.n_vit_h), int(item.n_vit_w)
+            patches = torch.as_tensor(item.feature, device=device).to(dtype)
+            features = self.aligner(self.vision(patches, h, w), h, w)
+            r = self.config.vision_downsample_ratio
+            types = image_token_types((h + r - 1) // r, (w + r - 1) // r).to(device)
+            span = torch.empty(
+                (len(types), self.config.hidden_size), device=device, dtype=dtype
+            )
+            span[types == 0] = self.image_start
+            span[types == 1] = features.to(dtype)
+            span[types == 2] = self.image_newline
+            span[types == 3] = self.image_end
+            spans.append(span)
+        return spans
+
+    def _prepare_mm_embeddings(self, input_ids, forward_batch):
+
+        # Keep scheduler hash IDs intact: the shared embedder clamps its input in place.
+        input_embeds, _ = embed_mm_inputs(
+            mm_inputs_list=[
+                item if item is not None else MultimodalInputs(mm_items=[])
+                for item in forward_batch.mm_inputs
+            ],
+            extend_prefix_lens=forward_batch.extend_prefix_lens_cpu,
+            extend_seq_lens=forward_batch.extend_seq_lens_cpu,
+            input_ids=input_ids.clone(),
+            input_embedding=self.get_input_embeddings(),
+            multimodal_model=self,
+        )
+        forward_batch.mm_input_embeds = input_embeds
+        return input_embeds
 
     def get_input_embeddings(self) -> nn.Module:
         return self.model.get_input_embeddings()
@@ -3712,6 +3800,21 @@ class DeepseekV4ForCausalLM(nn.Module):
         input_embeds: Optional[torch.Tensor] = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
+        if (
+            self.vision is not None
+            and not forward_batch.forward_mode.is_decode()
+            and forward_batch.mm_inputs is not None
+            and any(x is not None for x in forward_batch.mm_inputs)
+        ):
+            if input_embeds is not None:
+                raise ValueError("Cannot combine input_embeds and image inputs")
+            input_embeds = self._prepare_mm_embeddings(input_ids, forward_batch)
+        if self.vision is not None:
+            # Engram and modality-dependent routing consume semantic token IDs,
+            # while the scheduler and MM cache retain content-specific hash IDs.
+            input_ids = input_ids.masked_fill(
+                input_ids >= MM_PAD_SHIFT_VALUE, self.config.image_token_id
+            )
         if self.dsa_enable_prefill_cp:
             if can_dsa_cp_split(len(input_ids), self.cp_size, True, forward_batch):
                 forward_batch.attn_cp_metadata = prepare_context_parallel_metadata(
@@ -3838,6 +3941,8 @@ class DeepseekV4ForCausalLM(nn.Module):
         is_nextn: bool = False,
         num_hidden_layers: Optional[int] = None,
     ) -> str:
+        if name.startswith(("vision.", "aligner.", "image_")):
+            return name
         if name.startswith("embed."):
             return "model.embed_tokens." + name.removeprefix("embed.")
         if name.startswith("head."):
@@ -4060,9 +4165,13 @@ class DeepseekV4ForCausalLM(nn.Module):
                     skip_group = None
                     if not is_dsv41:
                         pass
-                    elif name.startswith(("vision.", "aligner.", "image_")):
+                    elif self.vision is None and name.startswith(
+                        ("vision.", "aligner.", "image_")
+                    ):
                         skip_group = "vision"
-                    elif name.endswith(".gate.e_score_correction_bias_vl"):
+                    elif self.vision is None and name.endswith(
+                        ".gate.e_score_correction_bias_vl"
+                    ):
                         skip_group = "gate.bias_vl"
                     if skip_group is not None:
                         skipped_by_group[skip_group] = (

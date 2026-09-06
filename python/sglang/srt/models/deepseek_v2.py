@@ -36,6 +36,7 @@ from sglang.kernels.ops.attention.dsv4 import (
 from sglang.kernels.ops.quantization.fp8_kernel import (
     create_per_token_group_quant_fp8_output_scale,
 )
+from sglang.srt.layers.dsv41.vl_routing import vision_topk
 from sglang.srt.batch_overlap.single_batch_overlap import SboFlags, compute_overlap_args
 from sglang.srt.batch_overlap.two_batch_overlap import (
     MaybeTboDeepEPDispatcher,
@@ -498,6 +499,12 @@ class MoEGate(nn.Module):
             self.e_score_correction_bias = nn.Parameter(correction_bias)
         else:
             self.e_score_correction_bias = None
+        self.e_score_correction_bias_vl = None
+        if config.model_type == "deepseek_v4.1" and config.vision_n_layers > 0:
+            self.e_score_correction_bias_vl = nn.Parameter(
+                torch.empty(config.n_routed_experts, dtype=torch.float32),
+                requires_grad=False,
+            )
         if _is_cpu and _is_cpu_amx_available:
             self.quant_method = PackWeightMethod(weight_names=["weight"])
         self.use_dsa = is_deepseek_dsa(config)
@@ -992,12 +999,15 @@ class DeepseekV2MoE(nn.Module):
                 if getattr(self, "is_hash", False)
                 else {}
             )
-            topk_output = self.topk(
-                hidden_states,
-                router_logits,
-                expert_location_dispatch_info=dispatch_info,
-                **topk_kwargs,
-            )
+            if self.gate.e_score_correction_bias_vl is not None:
+                topk_output = vision_topk(self, router_logits, input_ids_global)
+            else:
+                topk_output = self.topk(
+                    hidden_states,
+                    router_logits,
+                    expert_location_dispatch_info=dispatch_info,
+                    **topk_kwargs,
+                )
         deferred_finalize = (
             has_shared_output
             and not self._shared_expert_tp1
@@ -1108,12 +1118,15 @@ class DeepseekV2MoE(nn.Module):
                 if getattr(self, "is_hash", False)
                 else {}
             )
-            topk_output = self.topk(
-                hidden_states,
-                router_logits,
-                expert_location_dispatch_info=dispatch_info,
-                **topk_kwargs,
-            )
+            if self.gate.e_score_correction_bias_vl is not None:
+                topk_output = vision_topk(self, router_logits, input_ids_global)
+            else:
+                topk_output = self.topk(
+                    hidden_states,
+                    router_logits,
+                    expert_location_dispatch_info=dispatch_info,
+                    **topk_kwargs,
+                )
         else:
             pre_quant_input = None
             shared_output = None

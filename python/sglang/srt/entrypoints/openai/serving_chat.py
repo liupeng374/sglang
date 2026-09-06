@@ -1115,7 +1115,7 @@ class OpenAIServingChat(OpenAIServingBase):
         # Handle single vs multiple requests
         if request.input_ids is not None:
             prompt_kwargs = {"input_ids": processed_messages.prompt_ids}
-        elif is_multimodal and self.chat_encoding_spec == "kimi_k3":
+        elif is_multimodal and self.chat_encoding_spec in ("kimi_k3", "dsv41"):
             prompt_kwargs = {"input_ids": processed_messages.prompt_ids}
         elif is_multimodal:
             # Standard VLMs render a text prompt (with placeholder strings) for the MM
@@ -1473,8 +1473,17 @@ class OpenAIServingChat(OpenAIServingBase):
                     ),
                     return_multi_modal_data=True,
                 )
-                if media["images"] and not is_multimodal:
-                    raise ValueError("image input is not supported for this model")
+                if media["images"]:
+                    if not is_multimodal:
+                        raise ValueError("image input is not supported for this model")
+                    image_data.extend(image["url"] for image in media["images"])
+                    tokenizer = self.tokenizer_manager.tokenizer
+                    real_input = real_input.replace(
+                        encoding_dsv41.IMAGE_PLACEHOLDER,
+                        tokenizer.convert_ids_to_tokens(
+                            self.tokenizer_manager.model_config.hf_config.image_token_id
+                        ),
+                    )
                 prompt_ids = self.tokenizer_manager.tokenizer.encode(real_input)
             else:
                 real_input = encoding_dsv32.encode_messages(

@@ -185,6 +185,7 @@ try:
     # Drop the alias once transformers ships a deepseek_v4.1 config.
     class _DeepseekV41ConfigAlias(_HFDeepseekV3Config):
         model_type = "deepseek_v4.1"
+        vision_n_layers: int = 0
         # Each sublayer collapses the hc stream with the pre-mix its predecessor
         # produced (one-hot copy 0 at layer 0); the head collapses with the last
         # FFN's pre-mix instead of hc_head_* parameters.

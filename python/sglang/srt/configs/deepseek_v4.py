@@ -118,6 +118,18 @@ class DeepSeekV4Config(PretrainedConfig):
     engram_pad_id: int = 2
     engram_compressed_vocab_size: int = 0
 
+    vision_n_layers: int = 0
+    vision_dim: int = 1024
+    vision_n_heads: int = 16
+    vision_inter_dim: int = 2816
+    vision_patch_size: int = 14
+    vision_rope_theta: float = 10000.0
+    vision_downsample_ratio: int = 3
+    vision_max_n_token: int = 1024
+    vision_min_pixels: int = 295936
+    vision_max_wh_ratio: Optional[int] = None
+    image_token_id: int = 129264
+
     n_hash_layers: int = 3
     hc_mult: int = 4
     hc_pre_from_prev_sublayer: bool = False

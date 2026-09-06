@@ -2358,6 +2358,36 @@ class ServingChatTestCase(unittest.TestCase):
                 ]
             )
 
+    def test_dsv41_vision_preserves_image_order_and_reasoning_effort(self):
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.chat.chat_encoding_spec = "dsv41"
+        self.chat._dsv41_default_reasoning_effort = "high"
+        self.tm.model_config.hf_config.image_token_id = 129264
+        self.tm.tokenizer.convert_ids_to_tokens.return_value = "<image>"
+        request = ChatCompletionRequest(
+            model="x",
+            chat_template_kwargs={"thinking": True},
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": "second.png"}},
+                        {"type": "text", "text": "Compare"},
+                        {"type": "image_url", "image_url": {"url": "first.png"}},
+                    ],
+                }
+            ],
+        )
+        # Request conversion promotes numeric chat_template_kwargs to this field.
+        request.reasoning_effort = 42
+        result = self.chat._process_messages(request, is_multimodal=True)
+        prompt = self.tm.tokenizer.encode.call_args[0][0]
+        self.assertEqual(result.image_data, ["second.png", "first.png"])
+        self.assertEqual(prompt.count("<image>"), 2)
+        self.assertNotIn("<｜deepseek_image｜>", prompt)
+        self.assertIn("Reasoning Effort: 42", prompt)
+
     # ------------- dsv4 task + latest_reminder -------------
     def test_dsv4_task_field_schema(self):
         """Top-level `task` accepts the 6 DS task tokens and rejects others."""
