@@ -220,6 +220,10 @@ def _fp4_paged_mqa_logits(
     )
 
 
+# Arbitrary cap on one bf16 [rows, heads, lc] score chunk; transients run ~3x this.
+_TORCH_INDEXER_SCORE_BUDGET_BYTES = 1 << 30
+
+
 def _low_ratio_compression_metadata(
     compress_ratio: int, seq_lens_casual: torch.Tensor, raw_out_loc: torch.Tensor
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -2125,25 +2129,39 @@ class DeepseekV4AttnBackend(
             # Dequantize only this request's visible K rows; the full table is
             # pool-sized.
             index_k = pool.get_low_ratio_index_k_dequant(layer.layer_id, slots_j)
-            s = indexer.scores(q[tok], index_k, weights[tok])
-            s = s.masked_fill(j[None, :] >= lens[:, None], -torch.inf)
-            if publish is not None:
-                publish.append(
-                    select_candidate_blocks(
-                        s,
-                        lens[:, None],
-                        topk_blocks=indexer.candidate_topk_blocks,
-                        block_size=indexer.candidate_block_size,
-                    )
-                )
-            elif consume is not None:
-                s = s.masked_fill(~consume[b], -torch.inf)
             k = min(topk, lc)
-            idx = s.topk(k, dim=-1, sorted=False).indices.sort(dim=-1).values
-            reach = idx < lens[:, None]
-            page_indices[tok, :k] = torch.where(reach, slots_j[idx], -1).to(torch.int32)
-            if raw_indices is not None:
-                raw_indices[tok, :k] = torch.where(reach, idx, -1).to(torch.int32)
+            # Every step below is per query row; chunk rows so the [rows, heads, lc]
+            # bf16 scores stay under the budget (16 GiB at once for a 16k-token prompt).
+            rows_per_chunk = max(
+                1,
+                _TORCH_INDEXER_SCORE_BUDGET_BYTES // (q.shape[1] * lc * 2),
+            )
+            masks = [] if publish is not None else None
+            for start in range(0, tok.numel(), rows_per_chunk):
+                rows = slice(start, start + rows_per_chunk)
+                tok_c, lens_c = tok[rows], lens[rows]
+                s = indexer.scores(q[tok_c], index_k, weights[tok_c])
+                s = s.masked_fill(j[None, :] >= lens_c[:, None], -torch.inf)
+                if masks is not None:
+                    masks.append(
+                        select_candidate_blocks(
+                            s,
+                            lens_c[:, None],
+                            topk_blocks=indexer.candidate_topk_blocks,
+                            block_size=indexer.candidate_block_size,
+                        )
+                    )
+                elif consume is not None:
+                    s = s.masked_fill(~consume[b][rows], -torch.inf)
+                idx = s.topk(k, dim=-1, sorted=False).indices.sort(dim=-1).values
+                reach = idx < lens_c[:, None]
+                page_indices[tok_c, :k] = torch.where(reach, slots_j[idx], -1).to(
+                    torch.int32
+                )
+                if raw_indices is not None:
+                    raw_indices[tok_c, :k] = torch.where(reach, idx, -1).to(torch.int32)
+            if masks is not None:
+                publish.append(torch.cat(masks) if len(masks) > 1 else masks[0])
         if publish is not None:
             self.candidate_masks = publish
 

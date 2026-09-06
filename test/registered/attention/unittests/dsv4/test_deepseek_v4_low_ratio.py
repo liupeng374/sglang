@@ -473,3 +473,104 @@ class TestLowRatioTorchCompressor(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class _RowHashIndexer(_FakeIndexer):
+    """Scores are a deterministic function of each query row, so chunking rows must
+    not change them."""
+
+    def scores(self, q, k, weights):
+        seed = q[:, 0, 0].float().unsqueeze(-1)  # [t, 1]
+        pos = torch.arange(k.shape[0], dtype=torch.float32)
+        return torch.sin(seed * 7.0 + pos * 0.37) + 0.01 * pos
+
+
+class TestLowRatioTorchIndexerChunking(CustomTestCase):
+    """The score budget only bounds peak memory: chunked and unchunked runs must fill
+    the top-k buffers and the candidate masks identically."""
+
+    def _run(self, budget, *, ratio, topk, candidate_source, uses_candidates, masks):
+        from sglang.srt.layers.attention import deepseek_v4_backend as be
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
+            _low_ratio_sparse_buffers,
+        )
+
+        T, dim, heads = 37, 4, 3
+        pos = torch.arange(T, dtype=torch.int64)
+        req = torch.zeros(T, dtype=torch.int64)
+        lens_clamp1 = ((pos + 1) // ratio).clamp_min(1).to(torch.int32)
+        _, page_indices, raw_indices = _low_ratio_sparse_buffers(
+            lens_clamp1, topk, is_prefill=True
+        )
+        core = SimpleNamespace(
+            sparse_page_indices=lambda r: page_indices,
+            sparse_raw_indices=lambda r: raw_indices,
+        )
+        req_to_token = torch.arange(512, dtype=torch.int32).unsqueeze(0)
+        pool = SimpleNamespace(
+            get_low_ratio_index_k_dequant=lambda layer_id, slots: torch.zeros(
+                slots.numel(), dim, dtype=torch.bfloat16
+            ),
+        )
+        backend = _backend_with(core, pool, req_to_token)
+        backend.candidate_masks = masks
+        indexer = _RowHashIndexer(
+            topk, candidate_source=candidate_source, uses_candidates=uses_candidates
+        )
+        layer = SimpleNamespace(
+            layer_id=0, compress_ratio=ratio, indexer=indexer, freqs_cis=None
+        )
+        g = torch.Generator().manual_seed(0)
+        q = torch.randn(T, heads, dim, generator=g).to(torch.bfloat16)
+        x = torch.randn(T, heads, generator=g).to(torch.bfloat16)
+        saved = be._TORCH_INDEXER_SCORE_BUDGET_BYTES
+        be._TORCH_INDEXER_SCORE_BUDGET_BYTES = budget
+        try:
+            backend._low_ratio_index_topk_torch(layer, x, q, req, pos)
+        finally:
+            be._TORCH_INDEXER_SCORE_BUDGET_BYTES = saved
+        return page_indices, raw_indices, backend.candidate_masks
+
+    def test_chunked_equals_unchunked(self):
+        for ratio in (1, 2):
+            for budget in (1, 200, 10**12):  # 1 row, a few rows, everything at once
+                with self.subTest(ratio=ratio, budget=budget):
+                    full = self._run(
+                        10**12,
+                        ratio=ratio,
+                        topk=8,
+                        candidate_source=True,
+                        uses_candidates=False,
+                        masks=None,
+                    )
+                    got = self._run(
+                        budget,
+                        ratio=ratio,
+                        topk=8,
+                        candidate_source=True,
+                        uses_candidates=False,
+                        masks=None,
+                    )
+                    self.assertTrue(torch.equal(got[0], full[0]))
+                    self.assertTrue(torch.equal(got[1], full[1]))
+                    self.assertEqual(len(got[2]), 1)
+                    self.assertTrue(torch.equal(got[2][0], full[2][0]))
+                    # Consumer layer: the published masks are sliced per chunk.
+                    full_c = self._run(
+                        10**12,
+                        ratio=ratio,
+                        topk=8,
+                        candidate_source=False,
+                        uses_candidates=True,
+                        masks=full[2],
+                    )
+                    got_c = self._run(
+                        budget,
+                        ratio=ratio,
+                        topk=8,
+                        candidate_source=False,
+                        uses_candidates=True,
+                        masks=full[2],
+                    )
+                    self.assertTrue(torch.equal(got_c[0], full_c[0]))
+                    self.assertTrue(torch.equal(got_c[1], full_c[1]))
