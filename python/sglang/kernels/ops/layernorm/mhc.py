@@ -2027,6 +2027,173 @@ def _hc_combine_kernel(
     tl.store(y_ptr + pid_m * y_stride_m + offs_h, acc, mask=mask)
 
 
+@triton.jit
+def _hc_mix_stats_partial_kernel(
+    x_ptr,
+    w_ptr,
+    part_mix_ptr,
+    part_sq_ptr,
+    M,
+    K,
+    x_stride_m,
+    w_stride_n,
+    MIX: tl.constexpr,
+    MIX_PAD: tl.constexpr,
+    SPLIT_K: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    DOT_PRECISION: tl.constexpr,
+):
+    """Partial mixing dot products and row sum of squares over one fixed K slice.
+
+    Every tile shape and the K slicing are compile-time constants, so the
+    sequence of fp32 operations that produces a given row's outputs does not
+    depend on how many rows are in the batch (batch-invariant by construction).
+    """
+    pid_m = tl.program_id(0)
+    pid_k = tl.program_id(1)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, MIX_PAD)
+    mask_m = offs_m < M
+    mask_n = offs_n < MIX
+    k_per_split = K // SPLIT_K
+    k_start = pid_k * k_per_split
+    acc = tl.zeros([BLOCK_M, MIX_PAD], dtype=tl.float32)
+    sq = tl.zeros([BLOCK_M], dtype=tl.float32)
+    for kb in range(0, k_per_split, BLOCK_K):
+        offs_k = k_start + kb + tl.arange(0, BLOCK_K)
+        mask_k = offs_k < k_start + k_per_split
+        x_tile = tl.load(
+            x_ptr + offs_m[:, None] * x_stride_m + offs_k[None, :],
+            mask=mask_m[:, None] & mask_k[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        w_tile = tl.load(
+            w_ptr + offs_n[None, :] * w_stride_n + offs_k[:, None],
+            mask=mask_n[None, :] & mask_k[:, None],
+            other=0.0,
+        ).to(tl.float32)
+        acc += tl.dot(x_tile, w_tile, input_precision=DOT_PRECISION)
+        sq += tl.sum(x_tile * x_tile, axis=1)
+    tl.store(
+        part_mix_ptr + (pid_k * M + offs_m[:, None]) * MIX + offs_n[None, :],
+        acc,
+        mask=mask_m[:, None] & mask_n[None, :],
+    )
+    tl.store(part_sq_ptr + pid_k * M + offs_m, sq, mask=mask_m)
+
+
+@triton.jit
+def _hc_mix_stats_reduce_kernel(
+    part_mix_ptr,
+    part_sq_ptr,
+    mixes_ptr,
+    M,
+    inv_k,
+    eps,
+    MIX: tl.constexpr,
+    MIX_PAD: tl.constexpr,
+    SPLIT_K: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+):
+    """Sum the SPLIT_K partials in a fixed order and apply the rms scaling."""
+    pid_m = tl.program_id(0)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, MIX_PAD)
+    mask_m = offs_m < M
+    mask_n = offs_n < MIX
+    acc = tl.zeros([BLOCK_M, MIX_PAD], dtype=tl.float32)
+    sq = tl.zeros([BLOCK_M], dtype=tl.float32)
+    for s in tl.static_range(SPLIT_K):
+        acc += tl.load(
+            part_mix_ptr + (s * M + offs_m[:, None]) * MIX + offs_n[None, :],
+            mask=mask_m[:, None] & mask_n[None, :],
+            other=0.0,
+        )
+        sq += tl.load(part_sq_ptr + s * M + offs_m, mask=mask_m, other=0.0)
+    rsqrt = 1.0 / tl.sqrt(sq * inv_k + eps)
+    tl.store(
+        mixes_ptr + offs_m[:, None] * MIX + offs_n[None, :],
+        acc * rsqrt[:, None],
+        mask=mask_m[:, None] & mask_n[None, :],
+    )
+
+
+# Fixed launch configuration: changing any of these changes the rounding, so a
+# value must never be chosen from the batch size. Chosen on GB300 for K=20480,
+# MIX=24 against the fp32 cuBLAS + torch-reduction path it replaces: 1.5x faster
+# at M<=64, 3-4x faster at M>=1024, max rel error vs fp64 3.2e-7 (torch path
+# 6.1e-7). Triton lowers input_precision="ieee" to plain TF32 once BLOCK_M>=64
+# (max rel error 5e-4), so the fp32-class precision comes from "tf32x3", the
+# three-pass TF32 split with fp32 accumulation.
+_HC_MIX_SPLIT_K = 8
+_HC_MIX_BLOCK_M = 64
+_HC_MIX_BLOCK_K = 64
+_HC_MIX_NUM_WARPS = 8
+_HC_MIX_DOT_PRECISION = "tf32x3"
+
+
+def hc_mix_stats(x_flat: torch.Tensor, hc_fn: torch.Tensor, eps: float) -> torch.Tensor:
+    """Batch-invariant ``F.linear(x_flat.float(), hc_fn) * rsqrt(mean(x_flat^2) + eps)``.
+
+    x_flat is [M, K] in any float dtype (upcast to fp32 in the kernel, so it
+    equals ``x_flat.float()``), hc_fn is [MIX, K] fp32; returns [M, MIX] fp32.
+    The K slicing, tile shapes and reduction order are fixed constants, so a
+    row's result is bitwise identical whether it is computed alone or inside a
+    batch of any size; the fp32 cuBLAS GEMM and the torch row reduction it
+    replaces both pick their reduction order from M.
+    """
+    assert x_flat.dim() == 2 and hc_fn.dim() == 2
+    assert x_flat.stride(1) == 1 and hc_fn.stride(1) == 1
+    assert hc_fn.dtype == torch.float32
+    m, k = x_flat.shape
+    mix = hc_fn.shape[0]
+    assert hc_fn.shape[1] == k
+    assert k % (_HC_MIX_SPLIT_K * _HC_MIX_BLOCK_K) == 0, k
+    mix_pad = max(16, triton.next_power_of_2(mix))
+    part_mix = torch.empty(
+        (_HC_MIX_SPLIT_K, m, mix), dtype=torch.float32, device=x_flat.device
+    )
+    part_sq = torch.empty(
+        (_HC_MIX_SPLIT_K, m), dtype=torch.float32, device=x_flat.device
+    )
+    mixes = torch.empty((m, mix), dtype=torch.float32, device=x_flat.device)
+    if m == 0:
+        return mixes
+    grid_m = triton.cdiv(m, _HC_MIX_BLOCK_M)
+    _hc_mix_stats_partial_kernel[(grid_m, _HC_MIX_SPLIT_K)](
+        x_flat,
+        hc_fn,
+        part_mix,
+        part_sq,
+        m,
+        k,
+        x_flat.stride(0),
+        hc_fn.stride(0),
+        MIX=mix,
+        MIX_PAD=mix_pad,
+        SPLIT_K=_HC_MIX_SPLIT_K,
+        BLOCK_M=_HC_MIX_BLOCK_M,
+        BLOCK_K=_HC_MIX_BLOCK_K,
+        DOT_PRECISION=_HC_MIX_DOT_PRECISION,
+        num_warps=_HC_MIX_NUM_WARPS,
+    )
+    _hc_mix_stats_reduce_kernel[(grid_m,)](
+        part_mix,
+        part_sq,
+        mixes,
+        m,
+        1.0 / k,
+        eps,
+        MIX=mix,
+        MIX_PAD=mix_pad,
+        SPLIT_K=_HC_MIX_SPLIT_K,
+        BLOCK_M=_HC_MIX_BLOCK_M,
+        num_warps=4,
+    )
+    return mixes
+
+
 def hc_combine(
     x_flat: torch.Tensor, pre: torch.Tensor, hc: int, out_dtype: torch.dtype
 ) -> torch.Tensor:

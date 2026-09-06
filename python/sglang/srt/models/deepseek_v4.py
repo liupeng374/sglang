@@ -2483,12 +2483,23 @@ class DeepseekV4DecoderLayer(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Mixing coefficients come from x; the sublayer input is x collapsed with
         apply_pre (None selects copy 0). Returns (y, pre, post, comb)."""
-        from sglang.kernels.ops.layernorm.mhc import hc_combine
+        from sglang.kernels.ops.layernorm.mhc import hc_combine, hc_mix_stats
 
         dtype = x.dtype
-        x_flat = x.flatten(1).float()
-        rsqrt = torch.rsqrt(x_flat.square().mean(-1, keepdim=True) + self.rms_norm_eps)
-        mixes = (F.linear(x_flat, hc_fn) * rsqrt).unsqueeze(1)
+        x_flat = x.flatten(1)
+        if x.is_cuda and torch.version.cuda is not None:
+            # Both kernels upcast in registers, so x_flat stays a bf16 view.
+            # The mixing GEMM and the rms statistic run batch-invariantly;
+            # cuBLAS and torch's row reduction pick their summation order from
+            # num_tokens, which made a request's logits depend on its batch
+            # mates.
+            mixes = hc_mix_stats(x_flat, hc_fn, self.rms_norm_eps).unsqueeze(1)
+        else:
+            x_flat = x_flat.float()
+            rsqrt = torch.rsqrt(
+                x_flat.square().mean(-1, keepdim=True) + self.rms_norm_eps
+            )
+            mixes = (F.linear(x_flat, hc_fn) * rsqrt).unsqueeze(1)
         pre, post, comb = _get_mhc_ops().hc_split_sinkhorn(
             mixes,
             hc_scale,
