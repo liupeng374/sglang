@@ -670,7 +670,77 @@ class Fp8LinearMethod(LinearMethodBase):
             params_dtype=params_dtype,
         )
 
+    # ---- Shallow (DeepSeek-V4.1): 32x32-block FP8 dense -> DeepGEMM MXFP8 ------
+    #
+    # The checkpoint quantizes dense weights at a 32x32 block with ue8m0 scales,
+    # which the generic dispatcher sends to the Triton block-FP8 kernel because the
+    # block is not [128, 128]. That kernel then runs four times finer than the block
+    # it was tuned for -- K/32 loop iterations, an N/128 grid -- and this board has
+    # no tuned config at [32, 32] either.
+    #
+    # A 32x32 weight block is a *coarser* MX block: all 32 rows it covers share one
+    # ue8m0 scale, so repeating the scale 32x along N is an exactly equivalent 1x32
+    # (MX) layout, which DeepGEMM's block-scaled MMA consumes natively on Blackwell.
+    # Verified against an fp32 golden on all seven production shapes: relative error
+    # identical to the Triton path to three significant figures.
+    #
+    # Measured on GB300 at M=1 (Triton -> DeepGEMM MXFP8):
+    #   wqkv_a   (1792,5120)  75.8 ->  9.2 us   8.2x
+    #   wq_b     (8192,1280) 138.8 ->  5.6 us  24.7x
+    #   wo_b     (5120,2048)  89.6 ->  6.6 us  13.5x
+    #   shared13 (1152,5120)  63.1 ->  9.5 us   6.7x
+    #   shared_2 (5120, 576)  41.4 ->  4.6 us   9.0x
+    #   idx_wq_b (1024,1280)  20.2 ->  5.1 us   3.9x
+    #   engram   (6400,6144) 213.5 -> 12.3 us  17.4x
+    #
+    # SGLANG_SHALLOW_MXFP8_DENSE=0 keeps the Triton path, for A/B and as an escape.
+    def _try_promote_block32_to_mxfp8(self, layer: Module) -> bool:
+        import os
+
+        if os.environ.get("SGLANG_SHALLOW_MXFP8_DENSE", "1") != "1":
+            return False
+        if self.use_mxfp8 or self.weight_block_size != [32, 32]:
+            return False
+        from sglang.srt.layers.deep_gemm_wrapper.configurer import (
+            DEEPGEMM_SCALE_UE8M0,
+        )
+
+        # Pre-packed ue8m0 scales are a Blackwell-only DeepGEMM path; on Hopper the
+        # block-scaled MMA does not exist and this would be a pessimization.
+        if not DEEPGEMM_SCALE_UE8M0:
+            return False
+        scale = getattr(layer, "weight_scale_inv", None)
+        if scale is None or scale.dtype != torch.float32:
+            return False
+        n, k = layer.weight.shape
+        # DeepGEMM tiles N by 64; K only needs to be a whole number of MX blocks.
+        # K % 128 is deliberately *not* required: (5120, 576) is a production shape
+        # and was verified numerically identical to Triton, so apply() calls the
+        # kernel directly rather than going through the stricter wrapper gate.
+        if n % 64 or k % 32:
+            return False
+        if tuple(scale.shape) != ((n + 31) // 32, k // 32):
+            return False
+        # The packer asserts on a non-zero mantissa, so only an exactly-power-of-two
+        # (i.e. genuinely ue8m0) scale may be reinterpreted this way.
+        if bool((scale.data.contiguous().view(torch.int32) & 0x807FFFFF).any()):
+            return False
+
+        import deep_gemm.utils.layout
+
+        expanded = scale.data.repeat_interleave(32, dim=0)[:n].contiguous()
+        layer.weight_scale_inv_mx = Parameter(
+            deep_gemm.utils.layout.get_mn_major_tma_aligned_packed_ue8m0_tensor(
+                expanded
+            ),
+            requires_grad=False,
+        )
+        layer._shallow_mx_dense = True
+        return True
+
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
+        if self._try_promote_block32_to_mxfp8(layer):
+            return
         if self.convert_mxfp8_to_block:
             from sglang.srt.layers.quantization.mxfp8_block_convert import (
                 convert_mxfp8_weight_to_block_fp8,
@@ -1030,6 +1100,37 @@ class Fp8LinearMethod(LinearMethodBase):
                 bias=bias,
                 **extra_kwargs,
             )
+
+        if getattr(layer, "_shallow_mx_dense", False):
+            from sglang.kernels.ops.quantization.fp8_kernel import (
+                sglang_per_token_group_quant_fp8,
+                w8a8_mxfp8_matmul_deepgemm,
+            )
+
+            out_shape = (*x.shape[:-1], layer.weight.shape[0])
+            if isinstance(x, tuple):
+                q_input, x_scale = x
+                out_dtype = x[0].dtype
+                out_shape = (*x[0].shape[:-1], layer.weight.shape[0])
+            else:
+                out_dtype = x.dtype
+                q_input, x_scale = sglang_per_token_group_quant_fp8(
+                    x.view(-1, x.shape[-1]),
+                    32,
+                    column_major_scales=True,
+                    scale_tma_aligned=True,
+                    scale_ue8m0=True,
+                )
+            out = w8a8_mxfp8_matmul_deepgemm(
+                q_input,
+                layer.weight,
+                x_scale,
+                layer.weight_scale_inv_mx,
+                output_dtype=out_dtype,
+            )
+            if bias is not None:
+                out = out + bias
+            return out.view(*out_shape)
 
         if self.block_quant:
             if use_intel_amx_backend(layer):

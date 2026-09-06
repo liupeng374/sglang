@@ -76,6 +76,7 @@ from sglang.srt.layers.attention.verify_mask import (
 from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.layers.dsv41.indexer import select_candidate_blocks
 from sglang.srt.layers.dsv41.quant import fake_quant_fp4
+from sglang.srt.layers.attention.dsv4.dsv41_sparse import _rope_fq4
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import (
@@ -2068,7 +2069,7 @@ class DeepseekV4AttnBackend(
             )
         # The reference keeps the latent on the fp4 grid; the fp8 layout of the
         # pool stores those values exactly.
-        latent = fake_quant_fp4(rope_tail(latent, freqs, layer.rope_head_dim))
+        latent = _rope_fq4(latent, freqs, layer.rope_head_dim)
         pool.set_extra_key_buffer_fused(
             layer_id=layer.layer_id, loc=slots, cache_k=latent
         )
