@@ -1,5 +1,6 @@
 import unittest
 
+import dsv41_hc as hc
 import torch
 from ref_loader import (
     RefTestCase,
@@ -9,8 +10,6 @@ from ref_loader import (
     requires_ref,
     small_args,
 )
-
-from sglang.srt.layers.dsv41 import hc
 
 
 @requires_ref

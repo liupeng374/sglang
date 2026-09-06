@@ -2,12 +2,11 @@ import unittest
 
 import torch
 from args_util import to_v41_args
+from dsv41_block import Block
+from dsv41_hc import make_identity_pre_mix
+from dsv41_shared import SharedAttentionRuntime
 from ref_loader import RefTestCase, randomize_, requires_ref, small_args
 from test_indexer import TWO_LEVEL
-
-from sglang.srt.layers.dsv41.block import Block
-from sglang.srt.layers.dsv41.hc import make_identity_pre_mix
-from sglang.srt.layers.dsv41.shared import SharedAttentionRuntime
 
 
 @requires_ref

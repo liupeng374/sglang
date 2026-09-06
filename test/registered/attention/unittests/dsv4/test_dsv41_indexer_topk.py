@@ -88,7 +88,7 @@ class TestIndexerTopk(CustomTestCase):
             _expand_index_page_table,
             _fp4_paged_mqa_logits,
         )
-        from sglang.srt.layers.dsv41.quant import fake_quant_fp4
+        from sglang.srt.layers.attention.dsv4.torch_quant import fake_quant_fp4
 
         torch.manual_seed(ratio)
         bs, n_full_pages = 4, 8

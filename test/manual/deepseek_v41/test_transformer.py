@@ -3,11 +3,10 @@ import unittest
 
 import torch
 from args_util import to_v41_args
+from dsv41_transformer import Transformer
 from ref_loader import RefTestCase, randomize_, report, requires_ref, small_args
 from test_engram import ENGRAM
 from test_indexer import TWO_LEVEL
-
-from sglang.srt.layers.dsv41.transformer import Transformer
 
 TOKENIZER_DIR = os.getenv("DSV41_TOKENIZER_DIR")
 

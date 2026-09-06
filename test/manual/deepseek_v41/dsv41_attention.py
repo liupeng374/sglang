@@ -1,14 +1,14 @@
 import torch
+from dsv41_args import DeepseekV41Args
+from dsv41_compressor import Compressor
+from dsv41_indexer import Indexer
+from dsv41_linear import Linear
+from dsv41_norm import RMSNorm
+from dsv41_rope import apply_rotary_emb_tail, precompute_freqs_cis
+from dsv41_shared import SharedAttentionRuntime
 from torch import nn
 
-from sglang.srt.layers.dsv41.args import DeepseekV41Args
-from sglang.srt.layers.dsv41.compressor import Compressor
-from sglang.srt.layers.dsv41.indexer import Indexer
-from sglang.srt.layers.dsv41.linear import Linear
-from sglang.srt.layers.dsv41.norm import RMSNorm
-from sglang.srt.layers.dsv41.quant import fake_quant_fp4, fake_quant_fp8
-from sglang.srt.layers.dsv41.rope import apply_rotary_emb_tail, precompute_freqs_cis
-from sglang.srt.layers.dsv41.shared import SharedAttentionRuntime
+from sglang.srt.layers.attention.dsv4.torch_quant import fake_quant_fp4, fake_quant_fp8
 
 
 def sparse_attn(

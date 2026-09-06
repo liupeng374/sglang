@@ -1,8 +1,7 @@
 import dataclasses
 
 import msgspec
-
-from sglang.srt.layers.dsv41.args import DeepseekV41Args
+from dsv41_args import DeepseekV41Args
 
 
 def to_v41_args(ref_args) -> DeepseekV41Args:

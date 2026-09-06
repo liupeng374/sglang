@@ -14,11 +14,25 @@ from typing import Optional, Tuple
 import torch
 from torch import nn
 
-from sglang.srt.layers.dsv41.norm import RMSNorm
-from sglang.srt.layers.dsv41.quant import fake_quant_fp4
+from sglang.srt.layers.attention.dsv4.torch_quant import fake_quant_fp4
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.utils import add_prefix
+
+
+class RMSNorm(nn.Module):
+    """fp32 statistics and fp32 weight multiply, cast back at the very end."""
+
+    def __init__(self, dim: int, eps: float):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        dtype = x.dtype
+        x = x.float()
+        x = x * torch.rsqrt(x.square().mean(-1, keepdim=True) + self.eps)
+        return (self.weight * x).to(dtype)
 
 
 def token_req_indices(forward_batch) -> torch.Tensor:

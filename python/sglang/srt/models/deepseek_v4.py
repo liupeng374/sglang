@@ -92,8 +92,6 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
     is_dp_gatherv_active,
 )
-from sglang.srt.layers.dsv41.image_processor import image_token_types
-from sglang.srt.layers.dsv41.vision import Aligner, ViT
 from sglang.srt.layers.engram import (
     Engram,
     EngramHasher,
@@ -176,6 +174,8 @@ from sglang.srt.models.deepseek_v2 import (
     _is_npu,
     _is_xpu,
 )
+from sglang.srt.multimodal.dsv41.image_processor import image_token_types
+from sglang.srt.multimodal.dsv41.vision import Aligner, ViT
 from sglang.srt.runtime_context import (
     get_device,
     get_exec,

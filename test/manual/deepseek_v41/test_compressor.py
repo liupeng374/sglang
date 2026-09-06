@@ -1,9 +1,8 @@
 import unittest
 
 import torch
+from dsv41_compressor import Compressor
 from ref_loader import RefTestCase, randomize_, requires_ref, small_args
-
-from sglang.srt.layers.dsv41.compressor import Compressor
 
 
 @requires_ref
