@@ -2,15 +2,14 @@ import unittest
 
 import torch
 from args_util import to_v41_args
-from ref_loader import RefTestCase, randomize_, report, requires_ref, small_args
-from test_indexer import TWO_LEVEL
-
-from sglang.srt.layers.dsv41.attention import (
+from dsv41_attention import (
     Attention,
     get_window_topk_idxs,
     sparse_attn,
 )
-from sglang.srt.layers.dsv41.shared import SharedAttentionRuntime
+from dsv41_shared import SharedAttentionRuntime
+from ref_loader import RefTestCase, randomize_, report, requires_ref, small_args
+from test_indexer import TWO_LEVEL
 
 
 @requires_ref

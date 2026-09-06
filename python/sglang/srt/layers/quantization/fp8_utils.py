@@ -566,7 +566,10 @@ def dispatch_w8a8_block_fp8_linear(
     """
     if weight_block_size is not None and weight_block_size != [128, 128]:
         # DeepGEMM, FlashInfer groupwise and CUTLASS take 128x128 blocks only;
-        # the Triton kernel reads the block size at launch.
+        # the Triton kernel reads the block size at launch. With an explicit
+        # --fp8-gemm-backend flashinfer_* on Blackwell, Fp8LinearMethod routes 32-wide K
+        # blocks with ue8m0 scales to the MXFP8 dense kernels instead
+        # (can_serve_block_fp8_as_mxfp8) and keeps this Triton path as the fallback.
         return partial(triton_w8a8_block_fp8_linear, act_scale_ue8m0=act_scale_ue8m0)
 
     backend = get_fp8_gemm_runner_backend()
@@ -643,6 +646,90 @@ def _unsupported_mxfp8_linear(*args, **kwargs) -> torch.Tensor:
         "requires Blackwell (SM100/SM103/SM110/SM120) with FlashInfer, Hopper (SM90) "
         "with DeepGEMM, or ROCm gfx95."
     )
+
+
+def resolve_block_fp8_mxfp8_backend() -> Mxfp8DenseGemmBackend:
+    """MXFP8 backend for a 32-wide-K ue8m0 block-fp8 linear: opt-in only.
+
+    The route is taken when `--fp8-gemm-backend` names a FlashInfer MXFP8 kernel
+    (`flashinfer_cutedsl`, `flashinfer_cutlass`, `flashinfer_trtllm`); `auto` and
+    `triton` keep the Triton block kernel. Blackwell only: the block-scaled MMA does
+    not exist on Hopper and FlashInfer's MXFP8 GEMMs are not built there.
+    """
+    backend = get_fp8_gemm_runner_backend()
+    if not (
+        backend.is_flashinfer_cutedsl()
+        or backend.is_flashinfer_cutlass()
+        or backend.is_flashinfer_trtllm()
+    ):
+        return Mxfp8DenseGemmBackend.UNSUPPORTED
+    if not (_is_cuda and get_platform().is_blackwell and is_flashinfer_available()):
+        return Mxfp8DenseGemmBackend.UNSUPPORTED
+    resolved = resolve_mxfp8_dense_gemm_backend()
+    return resolved if resolved.is_flashinfer() else Mxfp8DenseGemmBackend.UNSUPPORTED
+
+
+def can_serve_block_fp8_as_mxfp8(
+    weight_block_size: Optional[List[int]], scale_fmt: Optional[str]
+) -> bool:
+    """Whether a block-fp8 linear can run on the MXFP8 dense GEMMs instead of Triton.
+
+    A weight quantized with a 32-wide K block and ue8m0 (power-of-two) scales, paired
+    with per-32 ue8m0 activation scales, is an MXFP8 operand: repeating each block scale
+    over its rows gives the per-row [N, K // 32] e8m0 layout the MXFP8 kernels read, so
+    the GEMM consumes exactly the same fp8 values and scales.
+    """
+    if weight_block_size is None or len(weight_block_size) != 2:
+        return False
+    if weight_block_size[1] != 32 or scale_fmt != "ue8m0":
+        return False
+    return not resolve_block_fp8_mxfp8_backend().is_unsupported()
+
+
+def dispatch_block_fp8_mxfp8_linear(backend: Mxfp8DenseGemmBackend) -> Callable:
+    """The MXFP8 linear for the block-fp8 route, with the FlashInfer autotuner kept out
+    of the kernel choice (see `flashinfer_mxfp8_blockscaled_linear`)."""
+    if backend.is_flashinfer_trtllm():
+        return partial(
+            flashinfer_mxfp8_blockscaled_linear, backend="trtllm", pin_tactic=True
+        )
+    if backend.is_flashinfer_cutlass():
+        return partial(
+            flashinfer_mxfp8_blockscaled_linear, backend="cutlass", pin_tactic=True
+        )
+    if backend.is_flashinfer_cutedsl():
+        return partial(
+            flashinfer_mxfp8_blockscaled_linear, backend="cute-dsl", pin_tactic=True
+        )
+    return _unsupported_mxfp8_linear
+
+
+def block_fp8_scale_to_mxfp8_e8m0(
+    weight_scale: torch.Tensor,
+    weight_shape: Tuple[int, int],
+    weight_block_size: List[int],
+) -> torch.Tensor:
+    """Expand fp32 power-of-two block scales [ceil(N / bn), K // 32] into the MXFP8
+    per-row e8m0 layout [N, K // 32] (uint8 exponent bytes), bit-exact."""
+    n, k = weight_shape
+    block_n, block_k = weight_block_size
+    if block_k != 32 or k % 32 != 0:
+        raise ValueError(
+            f"MXFP8 needs a 32-wide K block and K % 32 == 0, got {block_k=} {k=}"
+        )
+    scale = weight_scale.detach().float().contiguous()
+    if tuple(scale.shape) != (ceil_div(n, block_n), k // 32):
+        raise ValueError(
+            f"unexpected block scale shape {tuple(scale.shape)} for weight {weight_shape}"
+        )
+    bits = scale.view(torch.int32)
+    # A positive normal power of two has a zero mantissa; its exponent field is the e8m0 code.
+    if not bool(torch.all((bits & 0x7FFFFF) == 0)) or not bool(torch.all(scale > 0)):
+        raise ValueError(
+            "block scales are not positive powers of two; cannot encode as e8m0"
+        )
+    e8m0 = (bits >> 23).to(torch.uint8)
+    return e8m0.repeat_interleave(block_n, dim=0)[:n].contiguous()
 
 
 def dispatch_w8a8_mxfp8_linear() -> Callable:
@@ -1328,9 +1415,19 @@ def flashinfer_mxfp8_blockscaled_linear(
     bias: Optional[torch.Tensor] = None,
     output_dtype: Optional[torch.dtype] = None,
     backend: str = "cutlass",
+    pin_tactic: bool = False,
 ) -> torch.Tensor:
     """MXFP8 dense linear via FlashInfer mm_mxfp8. `weight_scale` must be the layout
-    the backend expects, prepared at load time."""
+    the backend expects, prepared at load time.
+
+    `pin_tactic` keeps the FlashInfer autotuner out of the kernel choice: `mm_mxfp8`
+    runs with `mxfp8_gemm` in the autotuner's skip set, so it always takes the
+    backend's heuristic tactic instead of a tactic tuned per M bucket (during the
+    server's warmup autotune and from its cache). A tuned tactic makes a row's fp32
+    reduction depend on the batch it was computed in; the heuristic tactic does not
+    (row-0 output bitwise equal across M = 1..16384 on every dense shape of
+    DeepSeek-V4.1, measured on GB300).
+    """
     input_2d = input.view(-1, input.shape[-1])
     output_shape = [*input.shape[:-1], weight.shape[0]]
 
@@ -1362,15 +1459,29 @@ def flashinfer_mxfp8_blockscaled_linear(
     else:
         weight_scale_t = weight_scale.t() if weight_scale.ndim == 2 else weight_scale
 
-    output = flashinfer_mm_mxfp8(
-        q_input,
-        weight.t(),
-        x_scale_u8,
-        weight_scale_t,
-        out_dtype=output_dtype,
-        use_8x4_sf_layout=False,
-        backend=backend,
-    )
+    if pin_tactic:
+        from flashinfer.autotuner import autotune
+
+        with autotune(False, skip_ops={"mxfp8_gemm"}):
+            output = flashinfer_mm_mxfp8(
+                q_input,
+                weight.t(),
+                x_scale_u8,
+                weight_scale_t,
+                out_dtype=output_dtype,
+                use_8x4_sf_layout=False,
+                backend=backend,
+            )
+    else:
+        output = flashinfer_mm_mxfp8(
+            q_input,
+            weight.t(),
+            x_scale_u8,
+            weight_scale_t,
+            out_dtype=output_dtype,
+            use_8x4_sf_layout=False,
+            backend=backend,
+        )
 
     if bias is not None:
         output += bias

@@ -2,10 +2,11 @@ import unittest
 
 import torch
 from args_util import to_v41_args
+from dsv41_indexer import Indexer
+from dsv41_shared import SharedAttentionRuntime
 from ref_loader import RefTestCase, assert_equal, randomize_, requires_ref, small_args
 
-from sglang.srt.layers.dsv41.indexer import Indexer, select_candidate_blocks
-from sglang.srt.layers.dsv41.shared import SharedAttentionRuntime
+from sglang.srt.layers.attention.dsv4.indexer import select_candidate_blocks
 
 # Mirrors the released layout: ratio-2 layers first (owner 1, reader 2), then ratio-1
 # layers (owner 3 is the candidate source, reader 4 filters by its candidates).

@@ -1,9 +1,8 @@
 import unittest
 
 import torch
+from dsv41_norm import RMSNorm
 from ref_loader import RefTestCase, assert_equal, randomize_, requires_ref
-
-from sglang.srt.layers.dsv41.norm import RMSNorm
 
 
 @requires_ref

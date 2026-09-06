@@ -390,7 +390,7 @@ class TestLowRatioTorchCompressor(CustomTestCase):
         from sglang.srt.layers.attention.deepseek_v4_backend import (
             _low_ratio_compression_metadata,
         )
-        from sglang.srt.layers.dsv41.quant import fake_quant_fp4
+        from sglang.srt.layers.attention.dsv4.torch_quant import fake_quant_fp4
 
         dim = 64
         writes = []

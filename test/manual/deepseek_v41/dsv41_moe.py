@@ -1,8 +1,7 @@
 import torch
 import torch.nn.functional as F
+from dsv41_linear import Linear
 from torch import nn
-
-from sglang.srt.layers.dsv41.linear import Linear
 
 
 class Gate(nn.Module):

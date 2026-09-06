@@ -1,13 +1,12 @@
 import unittest
 
 import torch
-from ref_loader import RefTestCase, assert_equal, requires_ref
-
-from sglang.srt.layers.dsv41.rope import (
+from dsv41_rope import (
     apply_rotary_emb,
     apply_rotary_emb_tail,
     precompute_freqs_cis,
 )
+from ref_loader import RefTestCase, assert_equal, requires_ref
 
 
 @requires_ref

@@ -1,40 +1,13 @@
 import torch
-import torch.nn.functional as F
+from dsv41_args import DeepseekV41Args
+from dsv41_linear import Linear
+from dsv41_norm import RMSNorm
+from dsv41_rope import apply_rotary_emb_tail
+from dsv41_shared import SharedAttentionRuntime
 from torch import nn
 
-from sglang.srt.layers.dsv41.args import DeepseekV41Args
-from sglang.srt.layers.dsv41.linear import Linear
-from sglang.srt.layers.dsv41.norm import RMSNorm
-from sglang.srt.layers.dsv41.quant import fake_quant_fp4
-from sglang.srt.layers.dsv41.rope import apply_rotary_emb_tail
-from sglang.srt.layers.dsv41.shared import SharedAttentionRuntime
-
-
-def select_candidate_blocks(
-    logits: torch.Tensor,
-    compress_lens: torch.Tensor | int,
-    topk_blocks: int,
-    block_size: int,
-) -> torch.Tensor:
-    """Level one of the two-level top-k: a bool mask over positions keeping the
-    topk_blocks best-scoring blocks per query. Unreachable positions are already -inf
-    in logits, so an all -inf block means not reachable yet; the block holding the
-    query's newest position is always kept."""
-    width = logits.size(-1)
-    scores = F.pad(logits, (0, -width % block_size), value=-torch.inf)
-    scores = scores.unflatten(-1, (-1, block_size)).amax(dim=-1)
-    num_blocks = scores.size(-1)
-
-    last = (compress_lens - 1) // block_size
-    scores = scores.masked_fill(
-        torch.arange(num_blocks, device=logits.device) == last, torch.inf
-    )
-
-    top = scores.topk(min(topk_blocks, num_blocks), dim=-1)
-    keep = torch.zeros_like(scores, dtype=torch.bool).scatter_(
-        -1, top.indices, top.values > -torch.inf
-    )
-    return keep.repeat_interleave(block_size, dim=-1)[..., :width]
+from sglang.srt.layers.attention.dsv4.indexer import select_candidate_blocks
+from sglang.srt.layers.attention.dsv4.torch_quant import fake_quant_fp4
 
 
 class Indexer(nn.Module):

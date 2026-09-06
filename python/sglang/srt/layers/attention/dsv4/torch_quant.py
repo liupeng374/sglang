@@ -9,35 +9,14 @@ power of two that maps the block absmax onto the format's max finite value.
 import torch
 import torch.nn.functional as F
 
+from sglang.srt.layers.quantization.fp8 import DSV4_DEQUANT_FP4_TABLE
+
 FP8_MAX = 448.0
 FP4_MAX = 6.0
 FP8_BLOCK_SIZE = 32
 FP4_BLOCK_SIZE = 32
 FP8_AMAX_FLOOR = 1e-4
 FP4_AMAX_FLOOR = 6 * 2.0**-126
-
-# Low nibble holds the even element, high nibble the odd one.
-_FP4_TABLE = torch.tensor(
-    [
-        0.0,
-        0.5,
-        1.0,
-        1.5,
-        2.0,
-        3.0,
-        4.0,
-        6.0,
-        -0.0,
-        -0.5,
-        -1.0,
-        -1.5,
-        -2.0,
-        -3.0,
-        -4.0,
-        -6.0,
-    ],
-    dtype=torch.float32,
-)
 
 
 def ceil_pow2(x: torch.Tensor) -> torch.Tensor:
@@ -104,7 +83,7 @@ def unpack_fp4_weight(weight: torch.Tensor) -> torch.Tensor:
     bytes_ = weight.view(torch.uint8)
     low = bytes_ & 0x0F
     high = (bytes_ >> 4) & 0x0F
-    table = _FP4_TABLE.to(weight.device)
+    table = DSV4_DEQUANT_FP4_TABLE.to(weight.device)
     return torch.stack([table[low.long()], table[high.long()]], dim=-1).flatten(-2)
 
 

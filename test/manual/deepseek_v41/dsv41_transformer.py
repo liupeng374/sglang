@@ -3,14 +3,13 @@ embed -> hc_mult copies -> blocks -> collapse -> logits."""
 
 import torch
 import torch.nn.functional as F
+from dsv41_args import DeepseekV41Args
+from dsv41_block import Block
+from dsv41_engram import EngramLayout, NgramHashState
+from dsv41_hc import hc_pre, make_identity_pre_mix
+from dsv41_norm import RMSNorm
+from dsv41_shared import SharedAttentionRuntime
 from torch import nn
-
-from sglang.srt.layers.dsv41.args import DeepseekV41Args
-from sglang.srt.layers.dsv41.block import Block
-from sglang.srt.layers.dsv41.engram import EngramLayout, NgramHashState
-from sglang.srt.layers.dsv41.hc import hc_pre, make_identity_pre_mix
-from sglang.srt.layers.dsv41.norm import RMSNorm
-from sglang.srt.layers.dsv41.shared import SharedAttentionRuntime
 
 
 class Embedding(nn.Module):

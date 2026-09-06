@@ -1,8 +1,7 @@
 import torch
+from dsv41_linear import Linear
+from dsv41_norm import RMSNorm
 from torch import nn
-
-from sglang.srt.layers.dsv41.linear import Linear
-from sglang.srt.layers.dsv41.norm import RMSNorm
 
 
 def pool_groups(kv: torch.Tensor, score: torch.Tensor, ratio: int) -> torch.Tensor:
