@@ -195,7 +195,6 @@ from sglang.srt.utils import (
     add_prefix,
     get_bool_env_var,
     is_gfx95_supported,
-    is_gfx942_supported,
     is_gfx1250_supported,
     is_sm120_supported,
     log_info_on_rank0,
@@ -368,7 +367,6 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 # SGLANG_SHARED_EXPERT_TP1=1 (replicated shared expert). Default OFF.
 _SHARED_EXPERT_LOCAL = get_bool_env_var("SGLANG_DP_SHARED_EXPERT_LOCAL")
 _is_gfx95_supported = is_gfx95_supported()
-_is_gfx942_supported = is_gfx942_supported()
 _is_gfx1250_supported = is_gfx1250_supported()
 
 if _use_aiter:
@@ -1742,14 +1740,13 @@ class MQALayer(MqaAttentionBase):
                 if skip_decode_pad
                 else (64 if self.n_local_heads <= 64 else self.n_heads)
             )
-            # Only [0:n_local_heads] is written below. Uninitialized padded TP
-            # heads inject NaN into attention on gfx942 (fnuz), so zero-init
-            # there; other archs tolerate new_empty and skip the per-forward
-            # memset.
-            if _is_gfx942_supported:
-                q_padded = x.new_zeros(x.shape[0], padded_num_heads, self.head_dim)
-            else:
-                q_padded = x.new_empty(x.shape[0], padded_num_heads, self.head_dim)
+            # Only [0:n_local_heads] is written below, but the kernel reads all
+            # padded heads. Uninitialized pad heads are not inert on any arch:
+            # on gfx942 (fnuz) they inject NaN, and on CUDA their allocator
+            # leftovers change the real heads' output, so the same request
+            # returns different logits depending on what ran before it. Always
+            # zero-init; the memset is 64 KB per token per layer.
+            q_padded = x.new_zeros(x.shape[0], padded_num_heads, self.head_dim)
             tp_slice = slice(0, self.n_local_heads)
             q_out = q_padded[:, tp_slice, :]
         attn_sink = self._local_attn_sink()
