@@ -3,6 +3,7 @@ from __future__ import annotations
 import concurrent.futures
 import functools
 import logging
+import os
 import time
 from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
@@ -1966,6 +1967,12 @@ class MQALayer(MqaAttentionBase):
         )
 
 
+# Fuses the mHC slice reduction and the sinkhorn into one kernel. Off by default
+# while it is being A/B'd: it moves the sinkhorn from TileLang to the in-tree
+# Triton port, which differs in transcendental lowering (max rel 1.2e-06).
+_FUSED_HC_SINKHORN = os.environ.get("SGLANG_SHALLOW_FUSED_HC_SINKHORN", "0") == "1"
+
+
 class DeepseekV4DecoderLayer(nn.Module):
     def __init__(
         self,
@@ -2483,10 +2490,33 @@ class DeepseekV4DecoderLayer(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Mixing coefficients come from x; the sublayer input is x collapsed with
         apply_pre (None selects copy 0). Returns (y, pre, post, comb)."""
-        from sglang.kernels.ops.layernorm.mhc import hc_combine, hc_mix_stats
+        from sglang.kernels.ops.layernorm.mhc import (
+            hc_combine,
+            hc_mix_stats,
+            hc_mix_stats_sinkhorn,
+        )
 
         dtype = x.dtype
         x_flat = x.flatten(1)
+        if _FUSED_HC_SINKHORN and x.is_cuda and torch.version.cuda is not None:
+            # One kernel for the slice reduction and the sinkhorn instead of two.
+            # The split-K partial still fixes the reduction order, so the
+            # batch-invariance this path exists for is unaffected.
+            pre, post, comb = hc_mix_stats_sinkhorn(
+                x_flat,
+                hc_fn,
+                hc_scale,
+                hc_base,
+                self.hc_mult,
+                self.hc_sinkhorn_iters,
+                self.rms_norm_eps,
+                self.hc_eps,
+            )
+            if apply_pre is None:
+                y = x[:, 0, :].contiguous()
+            else:
+                y = hc_combine(x_flat, apply_pre, self.hc_mult, dtype)
+            return y, pre, post, comb
         if x.is_cuda and torch.version.cuda is not None:
             # Both kernels upcast in registers, so x_flat stays a bf16 view.
             # The mixing GEMM and the rms statistic run batch-invariantly;
