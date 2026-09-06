@@ -54,9 +54,9 @@ def block_scale(x: torch.Tensor, block_size: int, fmax: float, amax_floor: float
     """Per-block ue8m0 scale, as fp32 powers of two, shape [..., N // block_size]."""
     amax = x.float().unflatten(-1, (-1, block_size)).abs().amax(dim=-1)
     amax = amax.clamp_min(amax_floor)
-    # The kernel multiplies by the fp32 reciprocal rather than dividing.
-    inv = torch.tensor(1.0 / fmax, dtype=torch.float32, device=x.device)
-    return ceil_pow2(amax * inv)
+    # The kernel multiplies by the fp32 reciprocal rather than dividing. A Python
+    # scalar keeps this free of host tensors, so it can run under CUDA graph capture.
+    return ceil_pow2(amax * (1.0 / fmax))
 
 
 def quant_fp8_act(x: torch.Tensor, block_size: int = FP8_BLOCK_SIZE):

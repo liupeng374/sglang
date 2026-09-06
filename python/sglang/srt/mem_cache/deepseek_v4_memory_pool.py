@@ -1128,8 +1128,11 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         # One packed indexer-K pool per ratio (the c4 DeepSeekV4IndexerPool layout),
         # indexed by the same compress_layer_id as the c1/c2 latent pools.
         self.low_ratio_index_pools: dict[int, DeepSeekV4IndexerPool] = {}
+        # Ratio-2 pending-pair state per req_pool_idx, plus a spare row for padded
+        # CUDA-graph rows (they carry req_pool_idx 0, a possibly live request).
         self.c2_pair_kv_state: dict[int, torch.Tensor] = {}
         self.c2_pair_score_state: dict[int, torch.Tensor] = {}
+        self.c2_pair_pad_row = self.num_req_slots
         if not any(self.low_ratio_sources.values()):
             return
         assert full_size is not None, "low compress ratios need the full pool size"
@@ -1168,13 +1171,13 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 for layer_id in sources:
                     if ratio == 2:
                         self.c2_pair_kv_state[layer_id] = torch.zeros(
-                            self.num_req_slots,
+                            self.num_req_slots + 1,
                             head_dim,
                             dtype=torch.float32,
                             device=device,
                         )
                         self.c2_pair_score_state[layer_id] = torch.zeros(
-                            self.num_req_slots,
+                            self.num_req_slots + 1,
                             head_dim,
                             dtype=torch.float32,
                             device=device,

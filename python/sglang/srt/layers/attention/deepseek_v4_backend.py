@@ -53,6 +53,7 @@ from sglang.srt.layers.attention.dsv4.compressor_v2 import (
 )
 from sglang.srt.layers.attention.dsv4.dsv41_sparse import (
     last_token_per_request,
+    pair_partners_decode,
     rope_tail,
     token_req_indices,
 )
@@ -1929,11 +1930,51 @@ class DeepseekV4AttnBackend(
         req = token_req_indices(forward_batch)
         pos = positions.to(torch.int64)
         if layer.compressor is not None:
-            self._low_ratio_compress(layer, x, req, pos)
+            self._low_ratio_compress(layer, x, req, pos, forward_batch)
         if layer.indexer is not None:
             self._low_ratio_index_topk(layer, x, q_lora, req, pos, forward_batch)
 
-    def _low_ratio_compress(self, layer, x, req, pos) -> None:
+    def _low_ratio_compress(self, layer, x, req, pos, forward_batch) -> None:
+        """Decode is fixed-shape and CUDA-graph safe; extend keeps the torch
+        version with its data-dependent grouping (it is never captured)."""
+        if forward_batch.forward_mode.is_decode():
+            self._low_ratio_compress_decode(layer, x, req, pos)
+        else:
+            self._low_ratio_compress_torch(layer, x, req, pos)
+
+    def _low_ratio_compress_decode(self, layer, x, req, pos) -> None:
+        pool = self.token_to_kv_pool
+        core = self.forward_metadata.core_metadata
+        ratio = layer.compress_ratio
+        kv, score = layer.compressor.project(x)
+        if ratio == 1:
+            pooled, group_pos, out_loc = kv, pos, core.c1_out_loc
+        else:
+            odd = pos % 2 == 1
+            # Padded graph rows write the reserved slot 0 and carry req_pool_idx 0,
+            # possibly a live request; route their pair state to the spare row.
+            is_pad = core.raw_out_loc == 0
+            req = torch.where(is_pad, torch.full_like(req, pool.c2_pair_pad_row), req)
+            partner_kv, partner_score = pair_partners_decode(
+                kv,
+                score,
+                odd,
+                req,
+                pool.c2_pair_kv_state[layer.layer_id],
+                pool.c2_pair_score_state[layer.layer_id],
+            )
+            pooled = layer.compressor.pool_pairs(
+                torch.stack([partner_kv, kv], dim=1),
+                torch.stack([partner_score, score], dim=1),
+            )
+            group_pos = torch.where(odd, pos - 1, pos)
+            out_loc = core.c2_out_loc
+        # Rows completing no group (even positions, padding) have out_loc -1 and
+        # write the reserved dummy slot 0 instead, so every shape stays static.
+        slots = torch.where(out_loc >= 0, out_loc, torch.zeros_like(out_loc))
+        self._low_ratio_write_group(layer, pooled, slots, group_pos)
+
+    def _low_ratio_compress_torch(self, layer, x, req, pos) -> None:
         pool = self.token_to_kv_pool
         core = self.forward_metadata.core_metadata
         ratio = layer.compress_ratio
@@ -1970,8 +2011,11 @@ class DeepseekV4AttnBackend(
             out_loc = core.c2_out_loc
         if not bool(group_mask.any()):
             return
+        self._low_ratio_write_group(layer, pooled, out_loc[group_mask], group_pos)
+
+    def _low_ratio_write_group(self, layer, pooled, slots, group_pos) -> None:
+        pool = self.token_to_kv_pool
         latent = layer.compressor.finish(pooled)
-        slots = out_loc[group_mask]
         freqs = layer.freqs_cis[group_pos]
         # Index keys come from the pre-RoPE latent, so publish them first. Stored
         # as fp4 (per-32 ue8m0, no hadamard), matching the reference indexer.

@@ -59,6 +59,26 @@ def last_token_per_request(mask: torch.Tensor, req: torch.Tensor) -> torch.Tenso
     return out
 
 
+def pair_partners_decode(
+    kv: torch.Tensor,
+    score: torch.Tensor,
+    odd: torch.Tensor,
+    req: torch.Tensor,
+    state_kv: torch.Tensor,
+    state_score: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Ratio-2 pairing for decode, one token per request: an odd position reads
+    its partner from the per-request state, an even one parks itself there.
+    `req` must be unique per row (padded rows go to a spare row). A partner is
+    returned for every row; only odd rows complete a group."""
+    partner_kv = state_kv[req]
+    partner_score = state_score[req]
+    keep = odd.unsqueeze(-1)
+    state_kv[req] = torch.where(keep, partner_kv, kv)
+    state_score[req] = torch.where(keep, partner_score, score)
+    return partner_kv, partner_score
+
+
 class DeepseekV41Compressor(nn.Module):
     """Pools compress_ratio consecutive tokens into one pre-RoPE KV latent.
     Ratio 1 is a plain bf16 projection; ratio 2 gates two tokens with a softmax
