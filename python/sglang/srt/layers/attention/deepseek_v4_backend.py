@@ -18,6 +18,7 @@ from typing import (
 import torch
 import torch.nn.functional as F
 
+from sglang.kernels.ops.attention.dsv4 import topk_transform_paged
 from sglang.kernels.ops.attention.dsv4.dequant_k_cache import (
     cast_q_fp8_for_q8kv8_prefill,
     dequantize_k_cache_paged,
@@ -158,6 +159,64 @@ def _create_flashmla_metadata():
     import sgl_kernel.flash_mla as flash_mla
 
     return flash_mla.get_mla_metadata()[0]
+
+
+def _expand_index_page_table(
+    page_table: torch.Tensor,
+    *,
+    full_page_size: int,
+    compress_ratio: int,
+    index_page_size: int,
+) -> torch.Tensor:
+    """Expand the FULL page table into the block table of a low-ratio indexer-K
+    pool, which pages at `index_page_size` slots rather than a FULL page.
+
+    The kernel resolves compressed slot j through
+    page_table[b, j // index_page_size] * index_page_size + j % index_page_size,
+    which with this expansion is the c1/c2 KV pool slot of the same position.
+    [bs, n_full_pages] -> [bs, n_full_pages * blocks_per_page], int32.
+    """
+    slots_per_page = full_page_size // compress_ratio
+    assert slots_per_page % index_page_size == 0, (
+        f"{full_page_size = } / {compress_ratio = } must be a multiple of "
+        f"{index_page_size = }"
+    )
+    blocks_per_page = slots_per_page // index_page_size
+    if blocks_per_page == 1:
+        return page_table
+    bs, n = page_table.shape
+    base = page_table.to(torch.int64) * blocks_per_page
+    offsets = torch.arange(blocks_per_page, device=page_table.device, dtype=torch.int64)
+    expanded = base.unsqueeze(-1) + offsets  # [bs, n, blocks_per_page]
+    return expanded.reshape(bs, n * blocks_per_page).to(torch.int32)
+
+
+def _fp4_paged_mqa_logits(
+    q_fp4: Tuple[torch.Tensor, torch.Tensor],
+    k_cache: torch.Tensor,
+    weights: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_table: torch.Tensor,
+    deep_gemm_metadata,
+    max_seq_len: int,
+) -> torch.Tensor:
+    """DeepGEMM paged fp4 logits for the low-ratio indexer. No hadamard: the
+    reference does not apply one."""
+    from deep_gemm import fp8_fp4_paged_mqa_logits as fn
+
+    sl = seq_lens.to(torch.int32)
+    if sl.dim() == 1:
+        sl = sl.unsqueeze(-1)
+    return fn(
+        q_fp4,
+        k_cache,
+        weights,
+        sl,
+        page_table,
+        deep_gemm_metadata,
+        max_seq_len,
+        False,
+    )
 
 
 def _low_ratio_compression_metadata(
@@ -562,6 +621,11 @@ class DSV4Metadata:
     core_attn_metadata: DSV4AttnMetadata
     indexer_metadata: Optional[PagedIndexerMetadata]
 
+    # Per-ratio indexer metadata for the dsv41 low-ratio sources (decode only;
+    # prefill uses the torch path). c4 keeps the dedicated indexer_metadata above.
+    c1_indexer_metadata: Optional[PagedIndexerMetadata] = None
+    c2_indexer_metadata: Optional[PagedIndexerMetadata] = None
+
     c4_compress_metadata: Optional[FusedCompressMetadata] = None
     c128_compress_metadata: Optional[FusedCompressMetadata] = None
 
@@ -577,6 +641,8 @@ class DSV4Metadata:
     def copy_(self, other: DSV4Metadata):
         self.core_attn_metadata.copy_(other.core_attn_metadata)
         maybe_copy_inplace(self.indexer_metadata, src=other.indexer_metadata)
+        maybe_copy_inplace(self.c1_indexer_metadata, src=other.c1_indexer_metadata)
+        maybe_copy_inplace(self.c2_indexer_metadata, src=other.c2_indexer_metadata)
         maybe_copy_inplace(self.c4_compress_metadata, src=other.c4_compress_metadata)
         maybe_copy_inplace(
             self.c128_compress_metadata, src=other.c128_compress_metadata
@@ -589,6 +655,12 @@ class DSV4Metadata:
             static_metadata.core_attn_metadata
         )
         maybe_copy_inplace(self.indexer_metadata, src=static_metadata.indexer_metadata)
+        maybe_copy_inplace(
+            self.c1_indexer_metadata, src=static_metadata.c1_indexer_metadata
+        )
+        maybe_copy_inplace(
+            self.c2_indexer_metadata, src=static_metadata.c2_indexer_metadata
+        )
         maybe_copy_inplace(
             self.c4_compress_metadata, src=static_metadata.c4_compress_metadata
         )
@@ -867,12 +939,36 @@ class DeepseekV4AttnBackend(
         self,
         core_attn_metadata: DSV4AttnMetadata,
         *,
+        compress_ratio: int = 4,
         use_prefill_cuda_graph: bool = False,
     ):
+        page_table = core_attn_metadata.page_table
+        index_page_size = 0
+        if compress_ratio == 4:
+            c_seq_lens = core_attn_metadata.c4_topk_lengths_raw
+        elif compress_ratio in (1, 2):
+            c_seq_lens = (
+                core_attn_metadata.c1_topk_lengths_clamp1
+                if compress_ratio == 1
+                else core_attn_metadata.c2_topk_lengths_clamp1
+            )
+            # The low-ratio indexer-K pool pages at 64 slots, not page_size //
+            # ratio, so the kernel needs a block table at that granularity.
+            index_page_size = self.token_to_kv_pool.get_index_k_page_size(
+                compress_ratio
+            )
+            page_table = _expand_index_page_table(
+                page_table,
+                full_page_size=self.page_size,
+                compress_ratio=compress_ratio,
+                index_page_size=index_page_size,
+            )
+        else:
+            raise ValueError(f"Unsupported indexer {compress_ratio = }")
         return PagedIndexerMetadata(
             page_size=self.page_size,
-            page_table=core_attn_metadata.page_table,
-            c4_seq_lens=core_attn_metadata.c4_topk_lengths_raw,
+            page_table=page_table,
+            c4_seq_lens=c_seq_lens,
             use_topk_v2=self.dsa_topk_backend.should_use_topk_v2() and not _is_xpu,
             # The SM120 FP4 kernel schedules split_kv=128, while the generic
             # JIT metadata planner encodes split_kv=256.
@@ -880,6 +976,8 @@ class DeepseekV4AttnBackend(
                 self.enable_deepseek_v4_fp4_indexer and get_platform().is_sm120
             ),
             use_prefill_cuda_graph=use_prefill_cuda_graph,
+            compress_ratio=compress_ratio,
+            index_page_size=index_page_size,
         )
 
     def init_forward_metadata_decode(
@@ -1179,6 +1277,18 @@ class DeepseekV4AttnBackend(
         )
         indexer_metadata = self.init_forward_metadata_indexer(core_attn_metadata)
 
+        low = core_attn_metadata.low_ratios
+        c1_indexer_metadata = (
+            self.init_forward_metadata_indexer(core_attn_metadata, compress_ratio=1)
+            if 1 in low
+            else None
+        )
+        c2_indexer_metadata = (
+            self.init_forward_metadata_indexer(core_attn_metadata, compress_ratio=2)
+            if 2 in low
+            else None
+        )
+
         create = functools.partial(
             create_paged_compressor_data,
             is_prefill=False,
@@ -1191,6 +1301,8 @@ class DeepseekV4AttnBackend(
         return DSV4Metadata(
             core_attn_metadata,
             indexer_metadata,
+            c1_indexer_metadata=c1_indexer_metadata,
+            c2_indexer_metadata=c2_indexer_metadata,
             c4_compress_metadata=create(compress_ratio=4),
             c128_compress_metadata=create(compress_ratio=128),
         )
@@ -1819,7 +1931,7 @@ class DeepseekV4AttnBackend(
         if layer.compressor is not None:
             self._low_ratio_compress(layer, x, req, pos)
         if layer.indexer is not None:
-            self._low_ratio_index_topk(layer, x, q_lora, req, pos)
+            self._low_ratio_index_topk(layer, x, q_lora, req, pos, forward_batch)
 
     def _low_ratio_compress(self, layer, x, req, pos) -> None:
         pool = self.token_to_kv_pool
@@ -1861,10 +1973,13 @@ class DeepseekV4AttnBackend(
         latent = layer.compressor.finish(pooled)
         slots = out_loc[group_mask]
         freqs = layer.freqs_cis[group_pos]
-        # Index keys come from the pre-RoPE latent, so publish them first.
+        # Index keys come from the pre-RoPE latent, so publish them first. Stored
+        # as fp4 (per-32 ue8m0, no hadamard), matching the reference indexer.
         if layer.indexer is not None and layer.indexer.owns_k:
-            pool.source_index_k[layer.layer_id][slots] = layer.indexer.index_keys(
-                latent, freqs
+            pool.set_index_k_fp4(
+                layer_id=layer.layer_id,
+                loc=slots,
+                cache_k=layer.indexer.index_keys(latent, freqs),
             )
         # The reference keeps the latent on the fp4 grid; the fp8 layout of the
         # pool stores those values exactly.
@@ -1873,12 +1988,74 @@ class DeepseekV4AttnBackend(
             layer_id=layer.layer_id, loc=slots, cache_k=latent
         )
 
-    def _low_ratio_index_topk(self, layer, x, q_lora, req, pos) -> None:
+    def _low_ratio_index_topk(self, layer, x, q_lora, req, pos, forward_batch) -> None:
+        """Decode goes through the DeepGEMM paged indexer (CUDA-graph safe); prefill
+        keeps the torch path (it is not captured, so its host syncs are fine)."""
+        if forward_batch.forward_mode.is_decode():
+            self._low_ratio_index_topk_decode(layer, x, q_lora, pos)
+        else:
+            self._low_ratio_index_topk_torch(layer, x, q_lora, req, pos)
+
+    def _low_ratio_index_topk_decode(self, layer, x, q_lora, pos) -> None:
+        from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
+            quantize_fp4_indexer_tensor,
+        )
+
         pool = self.token_to_kv_pool
         core = self.forward_metadata.core_metadata
         ratio = layer.compress_ratio
         indexer = layer.indexer
-        index_k = pool.source_index_k[pool.latent_source_layer(layer.layer_id)]
+        metadata = (
+            self.forward_metadata.c1_indexer_metadata
+            if ratio == 1
+            else self.forward_metadata.c2_indexer_metadata
+        )
+        assert metadata is not None, f"no decode indexer metadata for {ratio = }"
+
+        # fp4 query as (payload, scale), kernel layout [bs, 1, n_heads, dim]. The
+        # kernel sums head scores locally, so the indexer heads must be replicated.
+        assert indexer.n_local_heads == indexer.n_heads
+        q = indexer.queries(q_lora, layer.freqs_cis[pos])  # [bs, n_heads, 128] bf16
+        bs = q.shape[0]
+        q_fp4, q_sf = quantize_fp4_indexer_tensor(q.flatten(0, 1), rne=True)
+        q_fp4 = q_fp4.view(bs, 1, indexer.n_local_heads, 64)
+        q_sf = q_sf.view(bs, 1, indexer.n_local_heads)
+        weights = indexer.head_weights(x).float()  # [bs, n_local]
+
+        k_cache = pool.get_index_k_with_scale_buffer(layer.layer_id)
+        assert k_cache.dim() == 2
+        # Index pool page (64 slots); metadata.page_table is expanded to match.
+        page_size = metadata.c4_page_size
+        k_cache = k_cache.view(
+            k_cache.shape[0], page_size, 1, 68
+        )  # fp4: 64 payload + 4 scale
+
+        logits = _fp4_paged_mqa_logits(
+            (q_fp4, q_sf),
+            k_cache,
+            weights,
+            metadata.c4_seq_lens,
+            metadata.page_table,
+            metadata.deep_gemm_metadata,
+            metadata.max_c4_seq_len,
+        )
+
+        page_indices = core.sparse_page_indices(ratio)
+        raw_indices = core.sparse_raw_indices(ratio)
+        topk_transform_paged(
+            logits,
+            metadata.c4_seq_lens,
+            metadata.page_table,
+            page_indices,
+            page_size,
+            raw_indices,
+        )
+
+    def _low_ratio_index_topk_torch(self, layer, x, q_lora, req, pos) -> None:
+        pool = self.token_to_kv_pool
+        core = self.forward_metadata.core_metadata
+        ratio = layer.compress_ratio
+        indexer = layer.indexer
         # Same contract as the c4 indexer kernel: -1 padded slots, and the valid
         # prefix of every row is exactly sparse_topk_lengths long.
         page_indices = core.sparse_page_indices(ratio)
@@ -1901,7 +2078,10 @@ class DeepseekV4AttnBackend(
                 continue
             j = torch.arange(lc, device=pos.device)
             slots_j = self.req_to_token[r, j * ratio].to(torch.int64) // ratio
-            s = indexer.scores(q[tok], index_k[slots_j], weights[tok])
+            # Dequantize only this request's visible K rows; the full table is
+            # pool-sized.
+            index_k = pool.get_low_ratio_index_k_dequant(layer.layer_id, slots_j)
+            s = indexer.scores(q[tok], index_k, weights[tok])
             s = s.masked_fill(j[None, :] >= lens[:, None], -torch.inf)
             if publish is not None:
                 publish.append(

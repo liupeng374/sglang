@@ -14,12 +14,10 @@ from typing import Optional, Tuple
 import torch
 from torch import nn
 
-from sglang.srt.distributed import tensor_model_parallel_all_reduce
 from sglang.srt.layers.dsv41.norm import RMSNorm
 from sglang.srt.layers.dsv41.quant import fake_quant_fp4
-from sglang.srt.layers.linear import ColumnParallelLinear
+from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix
 
 
@@ -96,7 +94,11 @@ class DeepseekV41Compressor(nn.Module):
 
 class DeepseekV41Indexer(nn.Module):
     """Scores compressed positions with a small fp4 side attention. Only a
-    kv_source layer owns index keys; the other index sources read the source's."""
+    kv_source layer owns index keys; the other index sources read the source's.
+
+    The projections are replicated across TP, as in the c4 indexer: every rank
+    scores with all heads, so the decode kernel path needs no cross-rank
+    reduction and every rank selects the same top-k."""
 
     def __init__(
         self,
@@ -107,10 +109,8 @@ class DeepseekV41Indexer(nn.Module):
         prefix: str,
     ):
         super().__init__()
-        tp_size = get_parallel().tp_size
         self.n_heads = config.index_n_heads
-        assert self.n_heads % tp_size == 0
-        self.n_local_heads = self.n_heads // tp_size
+        self.n_local_heads = self.n_heads
         self.index_head_dim = config.index_head_dim
         self.rope_head_dim = config.qk_rope_head_dim
         self.index_topk = config.index_topk
@@ -120,14 +120,15 @@ class DeepseekV41Indexer(nn.Module):
         self.candidate_topk_blocks = config.candidate_topk_blocks
         self.candidate_block_size = config.candidate_block_size
         self.softmax_scale = self.index_head_dim**-0.5
-        self.wq_b = ColumnParallelLinear(
+        self.wq_b = ReplicatedLinear(
             config.q_lora_rank,
             self.n_heads * self.index_head_dim,
             bias=False,
             quant_config=quant_config,
+            params_dtype=torch.bfloat16,
             prefix=add_prefix("wq_b", prefix),
         )
-        self.weights_proj = ColumnParallelLinear(
+        self.weights_proj = ReplicatedLinear(
             config.hidden_size,
             self.n_heads,
             bias=False,
@@ -158,10 +159,8 @@ class DeepseekV41Indexer(nn.Module):
     def scores(
         self, q: torch.Tensor, k: torch.Tensor, weights: torch.Tensor
     ) -> torch.Tensor:
-        """q [t, H, d], k [n, d], weights [t, H] -> [t, n], reduced over all TP heads.
-        Kept in bf16 up to the reduction, as the reference does."""
+        """q [t, H, d], k [n, d], weights [t, H] -> [t, n], summed over all heads;
+        bf16 up to the reduction, as the reference does."""
         s = torch.einsum("bhd,nd->bhn", q, k)
         s = (s.relu() * weights.unsqueeze(-1)).sum(dim=1)
-        if get_parallel().tp_size > 1:
-            s = tensor_model_parallel_all_reduce(s)
         return s.float()
