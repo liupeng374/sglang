@@ -1,16 +1,16 @@
 """260903 image preprocessing, preserving raw token IDs for Engram."""
 
-from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
+from sglang.srt.layers.dsv41.image_processor import image_token_types, load_image
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
     MultimodalProcessorOutput,
 )
+from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     MultimodalSpecialTokens,
 )
-from sglang.srt.layers.dsv41.image_processor import load_image, image_token_types
 
 
 class DeepseekV41ImageProcessor(BaseMultimodalProcessor):

@@ -36,7 +36,6 @@ from sglang.kernels.ops.attention.dsv4 import (
 from sglang.kernels.ops.quantization.fp8_kernel import (
     create_per_token_group_quant_fp8_output_scale,
 )
-from sglang.srt.layers.dsv41.vl_routing import vision_topk
 from sglang.srt.batch_overlap.single_batch_overlap import SboFlags, compute_overlap_args
 from sglang.srt.batch_overlap.two_batch_overlap import (
     MaybeTboDeepEPDispatcher,
@@ -88,6 +87,7 @@ from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.layers.dcp.planner import (
     prepare_decode_context_parallel_metadata,
 )
+from sglang.srt.layers.dsv41.vl_routing import vision_topk
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,

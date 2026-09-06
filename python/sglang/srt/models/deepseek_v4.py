@@ -177,12 +177,12 @@ from sglang.srt.models.deepseek_v2 import (
     _is_xpu,
 )
 from sglang.srt.runtime_context import (
-    get_server_args,
     get_device,
     get_exec,
     get_forward,
     get_parallel,
     get_platform,
+    get_server_args,
 )
 
 if not _is_hip:
