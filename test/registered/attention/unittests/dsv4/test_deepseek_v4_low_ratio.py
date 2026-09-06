@@ -16,6 +16,16 @@ register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-large")
 INT32 = dict(dtype=torch.int32)
 
 
+def _extend_forward_batch():
+    """Not decode, and without the CPU length copies, so the extend dispatchers
+    take the torch path (the oracle these tests exercise)."""
+    return SimpleNamespace(
+        forward_mode=SimpleNamespace(is_decode=lambda: False, is_extend=lambda: True),
+        seq_lens_cpu=None,
+        extend_seq_lens_cpu=None,
+    )
+
+
 class TestLowRatioCompressionMetadata(CustomTestCase):
     def test_out_loc_and_lengths(self):
         from sglang.srt.layers.attention.deepseek_v4_backend import (
@@ -335,8 +345,9 @@ class TestLowRatioTorchIndexer(CustomTestCase):
         for r in range(4):
             req_to_token[r] = torch.arange(512) + 1024 * r
         pool = SimpleNamespace(
-            source_index_k={0: torch.zeros(8192, dim, dtype=torch.bfloat16)},
-            latent_source_layer=lambda layer_id: 0,
+            get_low_ratio_index_k_dequant=lambda layer_id, slots: torch.zeros(
+                slots.numel(), dim, dtype=torch.bfloat16
+            ),
         )
         backend = _backend_with(core, pool, req_to_token)
         layer = SimpleNamespace(
@@ -346,7 +357,7 @@ class TestLowRatioTorchIndexer(CustomTestCase):
             freqs_cis=torch.ones(1024, 2, dtype=torch.complex64),
         )
         x = torch.zeros(T, dim, dtype=torch.bfloat16)
-        backend._low_ratio_index_topk(layer, x, x, req, pos)
+        backend._low_ratio_index_topk(layer, x, x, req, pos, _extend_forward_batch())
         return page_indices, raw_indices, topk_lengths, req_to_token
 
     def test_valid_prefix_matches_metadata_lengths(self):
@@ -412,7 +423,9 @@ class TestLowRatioTorchCompressor(CustomTestCase):
             )
             core = SimpleNamespace(c1_out_loc=None, c2_out_loc=out_loc)
             backend = _backend_with(core, pool, req_to_token=None)
-            backend._low_ratio_compress(layer, x_all[pos], req, pos)
+            backend._low_ratio_compress(
+                layer, x_all[pos], req, pos, _extend_forward_batch()
+            )
 
         # Chunk 1 ends on an even position: pairs (0,1) and (2,3) complete, 4 waits.
         chunk([0, 1, 2, 3, 4])
@@ -467,6 +480,7 @@ class TestLowRatioTorchCompressor(CustomTestCase):
             torch.randn(3, dim, dtype=torch.bfloat16),
             torch.zeros(3, dtype=torch.int64),
             pos,
+            _extend_forward_batch(),
         )
         self.assertEqual(writes[0].tolist(), [259, 260, 261])
 
@@ -518,7 +532,10 @@ class TestLowRatioTorchIndexerChunking(CustomTestCase):
             topk, candidate_source=candidate_source, uses_candidates=uses_candidates
         )
         layer = SimpleNamespace(
-            layer_id=0, compress_ratio=ratio, indexer=indexer, freqs_cis=None
+            layer_id=0,
+            compress_ratio=ratio,
+            indexer=indexer,
+            freqs_cis=torch.zeros(4096),
         )
         g = torch.Generator().manual_seed(0)
         q = torch.randn(T, heads, dim, generator=g).to(torch.bfloat16)

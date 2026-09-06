@@ -446,6 +446,25 @@ class DeepSeekV4IndexerPool(KVCache):
             rne=self.index_k_rne,
         )
 
+    def get_index_k_fp4(
+        self, layer_id: int, slots: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Packed fp4 rows at `slots`: (payload int8 [n, 64], scales int32 [n]).
+        Inverse of the store_fp4_index_k_cache page layout
+        [page_size * 64 payload | page_size * 4 scale bytes]."""
+        assert self.use_fp4_indexer, "packed readback only applies to the fp4 layout"
+        buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
+        slots = slots.to(torch.int64)
+        p = self.page_size
+        page, off = (slots // p).unsqueeze(-1), slots % p
+        payload_cols = (off * 64).unsqueeze(-1) + torch.arange(64, device=buf.device)
+        scale_cols = (p * 64 + off * 4).unsqueeze(-1) + torch.arange(
+            4, device=buf.device
+        )
+        payload = buf[page, payload_cols].view(torch.int8)  # [n, 64]
+        scales = buf[page, scale_cols].contiguous().view(torch.int32).squeeze(-1)
+        return payload, scales
+
     def get_index_k_dequant(
         self, layer_id: int, slots: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
@@ -1328,6 +1347,17 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         return self._indexer_pool(compress_ratio).get_index_k_dequant(
             source_slot, slots
         )
+
+    def get_low_ratio_index_k_fp4(
+        self, layer_id: int, slots: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Packed fp4 index-K rows at `slots` from the layer's latent source:
+        (payload int8 [n, 64], ue8m0 scales packed int32 [n]), the kernel input
+        layout of quantize_fp4_indexer_tensor."""
+        compress_ratio, _, _ = self.layer_mapping[layer_id]
+        source = self.latent_source_layer(layer_id)
+        source_slot = self.low_ratio_sources[compress_ratio].index(source)
+        return self._indexer_pool(compress_ratio).get_index_k_fp4(source_slot, slots)
 
     def get_index_k_page_size(self, compress_ratio: int = 4) -> int:
         return self._indexer_pool(compress_ratio).page_size
