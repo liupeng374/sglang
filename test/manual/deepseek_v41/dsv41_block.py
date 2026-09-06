@@ -1,13 +1,12 @@
 import torch
+from dsv41_args import DeepseekV41Args
+from dsv41_attention import Attention
+from dsv41_engram import Engram, EngramLayout
+from dsv41_hc import hc_mixes, hc_post, hc_pre
+from dsv41_moe import MoE
+from dsv41_norm import RMSNorm
+from dsv41_shared import SharedAttentionRuntime
 from torch import nn
-
-from sglang.srt.layers.dsv41.args import DeepseekV41Args
-from sglang.srt.layers.dsv41.attention import Attention
-from sglang.srt.layers.dsv41.engram import Engram, EngramLayout
-from sglang.srt.layers.dsv41.hc import hc_mixes, hc_post, hc_pre
-from sglang.srt.layers.dsv41.moe import MoE
-from sglang.srt.layers.dsv41.norm import RMSNorm
-from sglang.srt.layers.dsv41.shared import SharedAttentionRuntime
 
 
 def build_moe(args: DeepseekV41Args, layer_id: int) -> MoE:

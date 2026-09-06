@@ -15,11 +15,11 @@ register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-large")
 
 def dev_dequantize(k_fp4: torch.Tensor, k_sf: torch.Tensor) -> torch.Tensor:
     """Invert dev's packed fp4 (payload [n,64] int8 + one packed-uint32 scale)."""
-    from sglang.srt.layers.dsv41.quant import _FP4_TABLE
+    from sglang.srt.layers.quantization.fp8 import DSV4_DEQUANT_FP4_TABLE
 
     u = k_fp4.view(torch.uint8)
     codes = torch.stack([u & 0x0F, (u >> 4) & 0x0F], dim=-1).flatten(1)  # [n, 128]
-    vals = _FP4_TABLE.to(k_fp4.device)[codes.long()]
+    vals = DSV4_DEQUANT_FP4_TABLE.to(k_fp4.device)[codes.long()]
     exps = torch.stack([(k_sf >> (8 * i)) & 0xFF for i in range(4)], dim=-1)
     scales = torch.exp2(exps.float() - 127).repeat_interleave(32, dim=-1)
     return vals * scales
@@ -30,7 +30,7 @@ class TestIndexerFp4Storage(CustomTestCase):
         from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
             quantize_fp4_indexer_tensor,
         )
-        from sglang.srt.layers.dsv41.quant import fake_quant_fp4
+        from sglang.srt.layers.attention.dsv4.torch_quant import fake_quant_fp4
 
         torch.manual_seed(0)
         x = (torch.randn(64, 128, device="cuda", dtype=torch.bfloat16) * 3).contiguous()
@@ -51,7 +51,7 @@ class TestIndexerFp4Storage(CustomTestCase):
         from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
             store_fp4_index_k_cache,
         )
-        from sglang.srt.layers.dsv41.quant import fake_quant_fp4
+        from sglang.srt.layers.attention.dsv4.torch_quant import fake_quant_fp4
 
         torch.manual_seed(1)
         n, page_size = 8, 128
@@ -91,7 +91,7 @@ class TestIndexerFp4Storage(CustomTestCase):
     def test_pool_dequant_readback(self):
         """get_index_k_dequant must invert the packed 64-slot page layout exactly;
         the prefill indexer reads K through it."""
-        from sglang.srt.layers.dsv41.quant import fake_quant_fp4
+        from sglang.srt.layers.attention.dsv4.torch_quant import fake_quant_fp4
         from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
             DSV41_INDEX_PAGE_SIZE,
             DeepSeekV4IndexerPool,

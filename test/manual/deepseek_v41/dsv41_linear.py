@@ -1,7 +1,11 @@
 import torch
 from torch import nn
 
-from sglang.srt.layers.dsv41.quant import FP4_BLOCK_SIZE, FP8_BLOCK_SIZE, naive_linear
+from sglang.srt.layers.attention.dsv4.torch_quant import (
+    FP4_BLOCK_SIZE,
+    FP8_BLOCK_SIZE,
+    naive_linear,
+)
 
 
 class Linear(nn.Module):

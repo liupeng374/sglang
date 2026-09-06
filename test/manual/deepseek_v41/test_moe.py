@@ -1,6 +1,7 @@
 import unittest
 
 import torch
+from dsv41_moe import Gate, MoE
 from ref_loader import (
     RefTestCase,
     assert_equal,
@@ -9,8 +10,6 @@ from ref_loader import (
     requires_ref,
     small_args,
 )
-
-from sglang.srt.layers.dsv41.moe import Gate, MoE
 
 
 @requires_ref

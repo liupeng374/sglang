@@ -5,7 +5,7 @@ import unittest
 import torch
 from ref_loader import RefTestCase, assert_equal, randomize_, report, requires_ref
 
-from sglang.srt.layers.dsv41.quant import (
+from sglang.srt.layers.attention.dsv4.torch_quant import (
     fake_quant_fp4,
     fake_quant_fp8,
     naive_linear,

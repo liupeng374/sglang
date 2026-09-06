@@ -470,7 +470,7 @@ class DeepSeekV4IndexerPool(KVCache):
     ) -> torch.Tensor:
         """Dequantized bf16 [n, index_head_dim] index K at `slots` (every slot when
         None); pass the slots you need, the full table is pool-sized."""
-        from sglang.srt.layers.dsv41.quant import _FP4_TABLE
+        from sglang.srt.layers.quantization.fp8 import DSV4_DEQUANT_FP4_TABLE
 
         assert self.use_fp4_indexer, "dequant readback only applies to the fp4 layout"
         buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
@@ -487,7 +487,9 @@ class DeepSeekV4IndexerPool(KVCache):
         )
         u = buf[page, payload_cols].view(torch.uint8)  # [n, 64]
         codes = torch.stack([u & 0x0F, (u >> 4) & 0x0F], dim=-1)  # [n, 64, 2]
-        vals = _FP4_TABLE.to(buf.device)[codes.long()].flatten(1)  # [n, 128]
+        vals = DSV4_DEQUANT_FP4_TABLE.to(buf.device)[codes.long()].flatten(
+            1
+        )  # [n, 128]
         exps = buf[page, scale_cols].to(torch.int32) & 0xFF  # [n, 4]
         scales = torch.exp2(exps.float() - 127).repeat_interleave(32, dim=-1)
         return (vals * scales).to(torch.bfloat16)

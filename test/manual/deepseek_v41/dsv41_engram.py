@@ -10,11 +10,11 @@ import msgspec
 import numpy as np
 import torch
 import torch.nn.functional as F
+from dsv41_args import DeepseekV41Args
+from dsv41_linear import Linear
 from torch import nn
 
-from sglang.srt.layers.dsv41.args import DeepseekV41Args
-from sglang.srt.layers.dsv41.linear import Linear
-from sglang.srt.layers.dsv41.quant import FP8_BLOCK_SIZE
+from sglang.srt.layers.attention.dsv4.torch_quant import FP8_BLOCK_SIZE
 
 
 def find_next_prime(start: int, seen_primes: set[int]) -> int:
