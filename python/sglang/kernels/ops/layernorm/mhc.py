@@ -2238,6 +2238,146 @@ def hc_mix_stats(x_flat: torch.Tensor, hc_fn: torch.Tensor, eps: float) -> torch
     return mixes
 
 
+@triton.jit
+def _hc_mix_reduce_sinkhorn_kernel(
+    part_mix_ptr,
+    part_sq_ptr,
+    scale_ptr,
+    base_ptr,
+    pre_ptr,
+    post_ptr,
+    comb_ptr,
+    m,
+    inv_k,
+    rms_eps,
+    MIX: tl.constexpr,
+    HC: tl.constexpr,
+    NUM_SLICES: tl.constexpr,
+    ITERS: tl.constexpr,
+    EPS: tl.constexpr,
+):
+    """Slice reduction + rms scaling + split/sinkhorn for one token row.
+
+    One CTA per row rather than one per BLOCK_M rows: that keeps the 4x4 sinkhorn
+    reductions two-dimensional (a [BLOCK_M, HC, HC] tile makes the cross-row
+    ``tl.sum(axis=1)`` cost more than the launch the fusion saves) and makes the
+    slice reduction *more* parallel than the standalone reduce, which puts every
+    row in a single CTA. The per-row arithmetic is the reduce kernel's followed by
+    the in-tree Triton sinkhorn port's, in that order.
+    """
+    row = tl.program_id(0)
+    if row >= m:
+        return
+    j = tl.arange(0, HC)
+    jj = j[:, None]
+    kk = j[None, :]
+
+    a_pre = tl.zeros([HC], dtype=tl.float32)
+    a_post = tl.zeros([HC], dtype=tl.float32)
+    a_comb = tl.zeros([HC, HC], dtype=tl.float32)
+    sq = tl.zeros([], dtype=tl.float32)
+    for s in tl.static_range(NUM_SLICES):
+        off = (s * m + row) * MIX
+        a_pre += tl.load(part_mix_ptr + off + j)
+        a_post += tl.load(part_mix_ptr + off + HC + j)
+        a_comb += tl.load(part_mix_ptr + off + 2 * HC + jj * HC + kk)
+        sq += tl.load(part_sq_ptr + s * m + row)
+    rsqrt = 1.0 / tl.sqrt(sq * inv_k + rms_eps)
+
+    s0 = tl.load(scale_ptr + 0)
+    s1 = tl.load(scale_ptr + 1)
+    s2 = tl.load(scale_ptr + 2)
+
+    pre = tl.sigmoid(a_pre * rsqrt * s0 + tl.load(base_ptr + j)) + EPS
+    tl.store(pre_ptr + row * HC + j, pre)
+    post = 2.0 * tl.sigmoid(a_post * rsqrt * s1 + tl.load(base_ptr + HC + j))
+    tl.store(post_ptr + row * HC + j, post)
+
+    comb = a_comb * rsqrt * s2 + tl.load(base_ptr + 2 * HC + jj * HC + kk)
+    comb = tl.exp(comb - tl.max(comb, axis=1)[:, None])
+    comb = comb / tl.sum(comb, axis=1)[:, None] + EPS
+    comb = comb / (tl.sum(comb, axis=0)[None, :] + EPS)
+    for _ in tl.static_range(ITERS - 1):
+        comb = comb / (tl.sum(comb, axis=1)[:, None] + EPS)
+        comb = comb / (tl.sum(comb, axis=0)[None, :] + EPS)
+    tl.store(comb_ptr + row * HC * HC + jj * HC + kk, comb)
+
+
+def hc_mix_stats_sinkhorn(
+    x_flat: torch.Tensor,
+    hc_fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    hc_mult: int,
+    sinkhorn_iters: int,
+    rms_eps: float,
+    hc_eps: float,
+):
+    """``hc_split_sinkhorn(hc_mix_stats(x_flat, hc_fn, rms_eps), ...)`` with the
+    reduce and the sinkhorn in one kernel.
+
+    The partial (split-K) kernel is unchanged and still sets the reduction order,
+    so the batch-invariance contract of ``hc_mix_stats`` carries over unchanged.
+    The sinkhorn half is the in-tree Triton port rather than the TileLang kernel,
+    which differs only in transcendental lowering (measured max rel 1.2e-06).
+    """
+    assert x_flat.dim() == 2 and hc_fn.dim() == 2
+    assert x_flat.stride(1) == 1 and hc_fn.stride(1) == 1
+    assert hc_fn.dtype == torch.float32
+    m, k = x_flat.shape
+    mix = hc_fn.shape[0]
+    assert mix == (2 + hc_mult) * hc_mult and hc_fn.shape[1] == k
+    dev = x_flat.device
+    pre = torch.empty(m, hc_mult, dtype=torch.float32, device=dev)
+    post = torch.empty(m, hc_mult, dtype=torch.float32, device=dev)
+    comb = torch.empty(m, hc_mult, hc_mult, dtype=torch.float32, device=dev)
+    if m == 0:
+        return pre, post, comb
+
+    num_slices = _num_slices_for(k)
+    mix_pad = max(16, triton.next_power_of_2(mix))
+    part_mix = torch.empty((num_slices, m, mix), dtype=torch.float32, device=dev)
+    part_sq = torch.empty((num_slices, m), dtype=torch.float32, device=dev)
+    block_m = _block_m_for(m)
+    _hc_mix_stats_partial_kernel[(triton.cdiv(m, block_m), num_slices)](
+        x_flat,
+        hc_fn,
+        part_mix,
+        part_sq,
+        m,
+        k,
+        x_flat.stride(0),
+        hc_fn.stride(0),
+        MIX=mix,
+        MIX_PAD=mix_pad,
+        NUM_SLICES=num_slices,
+        BLOCK_M=block_m,
+        BLOCK_K=_HC_MIX_BLOCK_K,
+        DOT_PRECISION=_HC_MIX_DOT_PRECISION,
+        num_warps=_HC_MIX_NUM_WARPS,
+        num_stages=_HC_MIX_NUM_STAGES,
+    )
+    _hc_mix_reduce_sinkhorn_kernel[(m,)](
+        part_mix,
+        part_sq,
+        hc_scale.float().contiguous(),
+        hc_base.float().contiguous(),
+        pre,
+        post,
+        comb,
+        m,
+        1.0 / k,
+        rms_eps,
+        MIX=mix,
+        HC=hc_mult,
+        NUM_SLICES=num_slices,
+        ITERS=sinkhorn_iters,
+        EPS=hc_eps,
+        num_warps=1,
+    )
+    return pre, post, comb
+
+
 def hc_combine(
     x_flat: torch.Tensor, pre: torch.Tensor, hc: int, out_dtype: torch.dtype
 ) -> torch.Tensor:
