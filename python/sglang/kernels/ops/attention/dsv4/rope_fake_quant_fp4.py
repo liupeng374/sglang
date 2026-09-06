@@ -23,11 +23,18 @@ FP4_AMAX_FLOOR = 6 * (2.0**-126)
 
 @triton.jit
 def _rope_tail_fake_quant_fp4_kernel(
-    x_ptr, f_ptr, out_ptr,
-    x_stride_r, out_stride_r, f_stride_t,
+    x_ptr,
+    f_ptr,
+    out_ptr,
+    x_stride_r,
+    out_stride_r,
+    f_stride_t,
     rows_per_token,
-    D: tl.constexpr, RD: tl.constexpr, BLK: tl.constexpr,
-    AMAX_FLOOR: tl.constexpr, INVERSE: tl.constexpr,
+    D: tl.constexpr,
+    RD: tl.constexpr,
+    BLK: tl.constexpr,
+    AMAX_FLOOR: tl.constexpr,
+    INVERSE: tl.constexpr,
 ):
     r = tl.program_id(0)
     t = r // rows_per_token
@@ -40,8 +47,12 @@ def _rope_tail_fake_quant_fp4_kernel(
     pos = offs - head_len
     j = pos // 2
     is_im = (pos % 2) == 1
-    re = tl.load(x_ptr + x_stride_r * r + head_len + 2 * j, mask=in_tail, other=0.0).to(tl.float32)
-    im = tl.load(x_ptr + x_stride_r * r + head_len + 2 * j + 1, mask=in_tail, other=0.0).to(tl.float32)
+    re = tl.load(x_ptr + x_stride_r * r + head_len + 2 * j, mask=in_tail, other=0.0).to(
+        tl.float32
+    )
+    im = tl.load(
+        x_ptr + x_stride_r * r + head_len + 2 * j + 1, mask=in_tail, other=0.0
+    ).to(tl.float32)
     # freqs arrives as the real view of a complex tensor, i.e. real and imag
     # interleaved on the last axis, so index 2*j / 2*j+1 rather than assuming a
     # unit stride -- `view_as_real(f)[..., 0]` has stride 2 along j, which silently
@@ -78,8 +89,11 @@ def _rope_tail_fake_quant_fp4_kernel(
 
 
 def rope_tail_fake_quant_fp4(
-    x: torch.Tensor, freqs: torch.Tensor, rope_dim: int,
-    inverse: bool = False, block_size: int = 32,
+    x: torch.Tensor,
+    freqs: torch.Tensor,
+    rope_dim: int,
+    inverse: bool = False,
+    block_size: int = 32,
 ) -> torch.Tensor:
     """One kernel for ``fake_quant_fp4(rope_tail(x, freqs, rope_dim))``.
 
@@ -97,11 +111,18 @@ def rope_tail_fake_quant_fp4(
     if rows == 0:
         return out
     _rope_tail_fake_quant_fp4_kernel[(rows,)](
-        x2, f_real, out.reshape(-1, d),
-        x2.stride(0), d, f_real.stride(0),
+        x2,
+        f_real,
+        out.reshape(-1, d),
+        x2.stride(0),
+        d,
+        f_real.stride(0),
         rows_per_token,
-        D=d, RD=rope_dim, BLK=block_size,
-        AMAX_FLOOR=FP4_AMAX_FLOOR, INVERSE=inverse,
+        D=d,
+        RD=rope_dim,
+        BLK=block_size,
+        AMAX_FLOOR=FP4_AMAX_FLOOR,
+        INVERSE=inverse,
         num_warps=4,
     )
     return out

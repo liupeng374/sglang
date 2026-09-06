@@ -9,9 +9,8 @@ on the FlashMLA sparse kernels.
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
-
 import os
+from typing import Optional, Tuple
 
 import torch
 from torch import nn
@@ -20,7 +19,6 @@ from sglang.srt.layers.attention.dsv4.torch_quant import fake_quant_fp4
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.utils import add_prefix
-
 
 _FUSED_ROPE_FQ4 = os.environ.get("SGLANG_SHALLOW_FUSED_ROPE_FQ4", "1") == "1"
 
