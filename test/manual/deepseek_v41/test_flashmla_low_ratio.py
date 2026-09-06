@@ -7,7 +7,7 @@ from sgl_kernel.flash_mla import FlashMLASchedMeta, flash_mla_with_kvcache
 
 from sglang.kernels.ops.attention.dsv4.attn import fused_store_cache
 from sglang.kernels.ops.attention.dsv4.dequant_k_cache import dequantize_k_cache_paged
-from sglang.srt.layers.dsv41.quant import fake_quant_fp4
+from sglang.srt.layers.attention.dsv4.torch_quant import fake_quant_fp4
 
 LAYOUT_BYTES = 584  # 448 fp8 nope + 64 bf16 rope + 8 scale bytes
 HEAD_DIM = 512

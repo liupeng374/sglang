@@ -57,7 +57,10 @@ from sglang.srt.layers.attention.dsv4.dsv41_sparse import (
     rope_tail,
     token_req_indices,
 )
-from sglang.srt.layers.attention.dsv4.indexer import C4IndexerBackendMixin
+from sglang.srt.layers.attention.dsv4.indexer import (
+    C4IndexerBackendMixin,
+    select_candidate_blocks,
+)
 from sglang.srt.layers.attention.dsv4.metadata import (
     _LARGE_INDEXER_QUERY_THRESHOLD,
     PagedIndexerMetadata,
@@ -69,13 +72,12 @@ from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
     SparsePrefillWorkspace,
     use_dsv4_q8kv8_sparse_prefill,
 )
+from sglang.srt.layers.attention.dsv4.torch_quant import fake_quant_fp4
 from sglang.srt.layers.attention.verify_mask import (
     VerifyMask,
     maybe_create_verify_mask,
 )
 from sglang.srt.layers.cp.utils import is_cp_v2_active
-from sglang.srt.layers.dsv41.indexer import select_candidate_blocks
-from sglang.srt.layers.dsv41.quant import fake_quant_fp4
 from sglang.srt.layers.attention.dsv4.dsv41_sparse import _rope_fq4
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode

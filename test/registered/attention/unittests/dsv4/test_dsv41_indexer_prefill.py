@@ -74,7 +74,7 @@ class TestPrefillIndexerKernelPath(CustomTestCase):
         from sglang.srt.layers.attention.deepseek_v4_backend import (
             _low_ratio_sparse_buffers,
         )
-        from sglang.srt.layers.dsv41.quant import fake_quant_fp4
+        from sglang.srt.layers.attention.dsv4.torch_quant import fake_quant_fp4
 
         torch.manual_seed(ratio)
         dev = "cuda"
@@ -361,7 +361,7 @@ class TestPrefillIndexerPieces(CustomTestCase):
         from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
             quantize_fp4_indexer_tensor,
         )
-        from sglang.srt.layers.dsv41.quant import fake_quant_fp4
+        from sglang.srt.layers.attention.dsv4.torch_quant import fake_quant_fp4
         from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4IndexerPool
 
         torch.manual_seed(5)

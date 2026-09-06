@@ -1,6 +1,7 @@
 import os
 import unittest
 
+import dsv41_engram as ours
 import torch
 from args_util import to_v41_args
 from ref_loader import (
@@ -11,8 +12,6 @@ from ref_loader import (
     requires_ref,
     small_args,
 )
-
-from sglang.srt.layers.dsv41 import engram as ours
 
 TOKENIZER_DIR = os.getenv("DSV41_TOKENIZER_DIR")
 
