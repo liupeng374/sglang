@@ -3666,10 +3666,8 @@ class DeepseekV4ForCausalLM(nn.Module):
         self.vision = None
         if config.model_type == "deepseek_v4.1" and config.vision_n_layers > 0:
             args = get_server_args()
-            if not args.disable_cuda_graph or not args.disable_radix_cache:
-                raise ValueError(
-                    "V4.1 vision currently requires --disable-cuda-graph --disable-radix-cache"
-                )
+            if not args.disable_cuda_graph:
+                raise ValueError("V4.1 vision currently requires --disable-cuda-graph")
             if (
                 get_parallel().attn_dp_size != 1
                 or get_parallel().attn_cp_size != 1

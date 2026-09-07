@@ -1178,8 +1178,11 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 self.c2_kv_pool = pool
             # Slots stay loc // ratio, like the c1/c2 KV pool; only the packed
             # buffer's page granularity differs (DSV41_INDEX_PAGE_SIZE).
+            # Note(kpham-sgl): FULL page 0 is reserved, so real slots extend
+            # past full_size.
+            # The indexer's own 64-slot padding page does not cover that gap.
             self.low_ratio_index_pools[ratio] = self._make_indexer_pool(
-                size=full_size // ratio,
+                size=(full_size + page_size) // ratio,
                 page_size=DSV41_INDEX_PAGE_SIZE,
                 dtype=dtype,
                 index_head_dim=self.indexer_head_dim,
