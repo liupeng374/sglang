@@ -52,9 +52,9 @@ from sglang.srt.layers.attention.dsv4.compressor_v2 import (
     create_paged_compressor_data,
 )
 from sglang.srt.layers.attention.dsv4.dsv41_sparse import (
+    _rope_fq4,
     last_token_per_request,
     pair_partners_decode,
-    rope_tail,
     token_req_indices,
 )
 from sglang.srt.layers.attention.dsv4.indexer import (
@@ -72,7 +72,6 @@ from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
     SparsePrefillWorkspace,
     use_dsv4_q8kv8_sparse_prefill,
 )
-from sglang.srt.layers.attention.dsv4.torch_quant import fake_quant_fp4
 from sglang.srt.layers.attention.verify_mask import (
     VerifyMask,
     maybe_create_verify_mask,
@@ -2070,7 +2069,7 @@ class DeepseekV4AttnBackend(
             )
         # The reference keeps the latent on the fp4 grid; the fp8 layout of the
         # pool stores those values exactly.
-        latent = fake_quant_fp4(rope_tail(latent, freqs, layer.rope_head_dim))
+        latent = _rope_fq4(latent, freqs, layer.rope_head_dim)
         pool.set_extra_key_buffer_fused(
             layer_id=layer.layer_id, loc=slots, cache_k=latent
         )
