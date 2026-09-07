@@ -2117,7 +2117,9 @@ def _hc_mix_stats_reduce_kernel(
 
 
 # Interim kernel, kept for its batch invariance, not its speed: a few percent of
-# tensor-core peak at large M; a hand-written replacement is expected.
+# tensor-core peak at large M; a hand-written replacement is expected. The row tile
+# is now picked from M (see _block_m_for), which is worth 1.6x at decode widths and
+# 1.1-1.2x in the hundreds, but it does not change the large-M picture.
 # The decomposition is fixed (slice count from K, BLOCK_M x BLOCK_K tiles,
 # tf32x3) because each choice changes the rounding; none may depend on M.
 # "ieee" is not an option: Triton lowers it to plain TF32 once BLOCK_M >= 64.
@@ -2130,6 +2132,33 @@ _HC_MIX_BLOCK_M = 32
 _HC_MIX_BLOCK_K = 64
 _HC_MIX_NUM_WARPS = 4
 _HC_MIX_DOT_PRECISION = "tf32x3"
+# num_stages only reorders memory issue, not arithmetic; 2 is enough to cover the
+# short k_per_slice loop (K=20480 gives 80 slices, i.e. 4 BLOCK_K tiles per CTA).
+_HC_MIX_NUM_STAGES = 2
+
+# Unlike the slice count, BLOCK_M may be chosen from M. The dot reduces along K in
+# BLOCK_K tiles, so the M tile size does not enter a row's fp32 operation sequence:
+# BLOCK_M 8 / 16 / 32 are bitwise identical to each other at every M from 1 to 1024
+# (verified against the shipped BLOCK_M=32 in the sweep this table came from). 64 is
+# excluded -- that is where Triton drops tf32x3 for plain TF32 and the result moves.
+# GB300, K=20480, MIX=24, CUDA-graph replay, GPU us per call (partial + reduce):
+#   M          1     6     8    16    32    64   256   1024   4096
+#   BLOCK_M=8  8.8   8.4   8.2   9.6  10.7  16.0  37.2  125.5  582.9
+#   BLOCK_M=16 21.7  9.0   8.8   9.0  10.7  14.3  30.0   89.2  437.2
+#   BLOCK_M=32 13.9  13.9  13.6  13.9  14.8  17.6  34.4   92.8  388.9  <- was always this
+_HC_MIX_BLOCK_M_SMALL = 8
+_HC_MIX_BLOCK_M_MID = 16
+_HC_MIX_MID_MAX_M = 2048
+
+
+def _block_m_for(m: int) -> int:
+    """Row-tile height for M rows. Every choice here is bitwise interchangeable,
+    so this is free to depend on M; see the table above for why it should."""
+    if m <= _HC_MIX_BLOCK_M_SMALL:
+        return _HC_MIX_BLOCK_M_SMALL
+    if m <= _HC_MIX_MID_MAX_M:
+        return _HC_MIX_BLOCK_M_MID
+    return _HC_MIX_BLOCK_M
 
 
 def _num_slices_for(k: int) -> int:
@@ -2168,7 +2197,8 @@ def hc_mix_stats(x_flat: torch.Tensor, hc_fn: torch.Tensor, eps: float) -> torch
     mixes = torch.empty((m, mix), dtype=torch.float32, device=x_flat.device)
     if m == 0:
         return mixes
-    grid_m = triton.cdiv(m, _HC_MIX_BLOCK_M)
+    block_m = _block_m_for(m)
+    grid_m = triton.cdiv(m, block_m)
     _hc_mix_stats_partial_kernel[(grid_m, num_slices)](
         x_flat,
         hc_fn,
@@ -2181,10 +2211,11 @@ def hc_mix_stats(x_flat: torch.Tensor, hc_fn: torch.Tensor, eps: float) -> torch
         MIX=mix,
         MIX_PAD=mix_pad,
         NUM_SLICES=num_slices,
-        BLOCK_M=_HC_MIX_BLOCK_M,
+        BLOCK_M=block_m,
         BLOCK_K=_HC_MIX_BLOCK_K,
         DOT_PRECISION=_HC_MIX_DOT_PRECISION,
         num_warps=_HC_MIX_NUM_WARPS,
+        num_stages=_HC_MIX_NUM_STAGES,
     )
     _hc_mix_stats_reduce_kernel[(grid_m,)](
         part_mix,
@@ -2196,7 +2227,7 @@ def hc_mix_stats(x_flat: torch.Tensor, hc_fn: torch.Tensor, eps: float) -> torch
         MIX=mix,
         MIX_PAD=mix_pad,
         NUM_SLICES=num_slices,
-        BLOCK_M=_HC_MIX_BLOCK_M,
+        BLOCK_M=block_m,
         num_warps=4,
     )
     return mixes
