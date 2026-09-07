@@ -2121,15 +2121,10 @@ def _hc_mix_stats_reduce_kernel(
 # The decomposition is fixed (slice count from K, BLOCK_M x BLOCK_K tiles,
 # tf32x3) because each choice changes the rounding; none may depend on M.
 # "ieee" is not an option: Triton lowers it to plain TF32 once BLOCK_M >= 64.
-# GB300, K=20480, MIX=24, CUDA graph replay, GPU us per call:
-#   M                                1     32   1024   4096  16384
-#   torch path (cuBLAS + reduce)  14.4   26.6    190    715   2028
-#   this                          12.8   14.3     93    386   1525
-#   8 slices, BLOCK_M=64, 8 warps   64     63     65    178    608  (8 CTAs at decode)
-# Decode won the trade; the 32-row tile fills half an MMA at large M. A CUDA
-# kernel can have both with a fixed m64 MMA schedule and zero-padded rows for
-# M < 64 (same per-row instruction sequence at every M); the contract to keep
-# is test_hc_mix_stats.py (a row alone == the same row in any batch, bitwise).
+# BLOCK_M 32 over 64: measured on GB300 (K=20480, MIX=24, CUDA graph replay)
+# the 32-row tile costs 12.8 us per call at M=1 against 64 us for a 64-row tile,
+# and loses at large M; decode won the trade. The contract to keep is
+# test_hc_mix_stats.py: a row alone is bitwise equal to that row in any batch.
 _HC_MIX_SLICE_CHOICES = (80, 64, 40, 32, 16, 8, 4, 2, 1)
 _HC_MIX_BLOCK_M = 32
 _HC_MIX_BLOCK_K = 64
