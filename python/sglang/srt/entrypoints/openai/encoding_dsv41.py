@@ -40,7 +40,6 @@ SYSTEM_SP_TOKEN = "<｜System｜>"
 LATEST_REMINDER_SP_TOKEN = "<｜latest_reminder｜>"
 
 IMAGE_PLACEHOLDER = "<｜deepseek_image｜>"
-IMAGE_TAG_PATTERN = re.compile(r"<image>(.*?)</image>", re.DOTALL)
 
 # Task special tokens for internal classification tasks
 DS_TASK_SP_TOKENS = {
@@ -583,35 +582,6 @@ def sort_tool_results_by_call_order(
 # ============================================================
 
 
-def parse_tagged_text(text: str) -> Union[str, List[Dict[str, Any]]]:
-    """Convert ``<image>path</image>`` text into standard content blocks."""
-    matches = list(IMAGE_TAG_PATTERN.finditer(text))
-    remaining = IMAGE_TAG_PATTERN.sub("", text)
-    if "<image>" in remaining or "</image>" in remaining:
-        raise ValueError("Malformed <image>path</image> tag")
-    if not matches:
-        return text
-
-    blocks: List[Dict[str, Any]] = []
-    cursor = 0
-    for match in matches:
-        if match.start() > cursor:
-            blocks.append({"type": "text", "text": text[cursor : match.start()]})
-        path = match.group(1)
-        if not path:
-            raise ValueError("Image path must not be empty")
-        blocks.append(
-            {
-                "type": "image_url",
-                "image_url": {"url": path},
-            }
-        )
-        cursor = match.end()
-    if cursor < len(text):
-        blocks.append({"type": "text", "text": text[cursor:]})
-    return blocks
-
-
 def _is_image_block(block: Dict[str, Any]) -> bool:
     return isinstance(block, dict) and block.get("type") in ("image", "image_url")
 
@@ -722,12 +692,6 @@ def process_image_messages(
 def _drop_thinking_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     Drop reasoning_content and non-essential messages before the last user message.
-
-    Behavior:
-    - Messages with role in ["user", "system", "tool", "latest_reminder"] are always kept.
-    - Messages at or after the last user index are always kept.
-    - Assistant messages before the last user get reasoning_content removed.
-    - Developer messages before the last user are dropped entirely.
     """
     last_user_idx = find_last_user_index(messages)
     result = []
