@@ -222,6 +222,88 @@ class NPUDeepSeekV4IndexerPool(DeepSeekV4IndexerPool):
             )
 
 
+class NPULowRatioIndexerPool(DeepSeekV4IndexerPool):
+    """DSV4.1 low compress-ratio (c1/c2) indexer-K pool for NPU.
+
+    The CUDA layout packs fp4 payload + ue8m0 scales per 64-slot page for the
+    DeepGEMM paged indexer. NPU runs the torch scorer instead
+    (``DeepseekV41Indexer.scores``), so K is stored as plain bf16 rows
+    addressed by the compressed slot (= full-pool loc // ratio).
+
+    This keeps the model numerics intact: the indexer writes index keys that
+    were already snapped onto the fp4 grid by rope + ``fake_quant_fp4``
+    (``_rope_fq4``), and every fp4 e2m1 grid value is exactly representable
+    in bf16 — so bf16 storage is a lossless stand-in for the packed fp4 bytes.
+    """
+
+    def __init__(
+        self,
+        size: int,
+        page_size: int,
+        dtype: torch.dtype,
+        index_head_dim: int,
+        layer_num: int,
+        device: str,
+        enable_memory_saver: bool,
+    ):
+        # use_fp4_indexer=False keeps get_bytes_per_token on the packed-free
+        # accounting; the bf16 buffer below replaces the CUDA packed layout.
+        super().__init__(
+            size,
+            page_size,
+            dtype,
+            index_head_dim,
+            layer_num,
+            device,
+            enable_memory_saver,
+            use_fp4_indexer=False,
+        )
+        # Low-ratio pools round to nearest even, as the reference does.
+        self.index_k_rne = True
+
+    def _create_buffer(self):
+        # Flat slot-addressed bf16 rows; no page structure needed because only
+        # the torch scorer reads this pool (never the NPU paged kernel).
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            self.index_k_bf16_buffer = [
+                torch.zeros(
+                    self.size,
+                    1,
+                    self.index_head_dim,
+                    dtype=torch.bfloat16,
+                    device=self.device,
+                )
+                for _ in range(self.layer_num)
+            ]
+        self.index_k_with_scale_buffer = None
+        self.index_k_payload_buffer = None
+        self.index_k_scale_buffer = None
+
+    def get_bytes_per_token(self) -> int:
+        return self.index_head_dim * 2
+
+    def set_index_fp4(
+        self,
+        layer_id: int,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+    ) -> None:
+        # The CUDA name is kept so the community base's set_index_k_fp4 route
+        # lands here; cache_k is bf16 [n, index_head_dim] already on the fp4
+        # grid, so a plain scatter preserves it exactly.
+        buf = self.index_k_bf16_buffer[layer_id]
+        buf[loc.to(torch.int64)] = cache_k.to(buf.dtype).unsqueeze(1)
+
+    def get_index_k_dequant(
+        self, layer_id: int, slots: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """bf16 [n, index_head_dim] index K at `slots` (every slot when None)."""
+        buf = self.index_k_bf16_buffer[layer_id]
+        if slots is None:
+            return buf.squeeze(1)
+        return buf[slots.to(torch.int64)].squeeze(1)
+
+
 class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
     """NPU-only DSV4 KV pool with explicit-location ring state buffers.
 
@@ -265,13 +347,19 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             f"(got c4 pool class {cls.__name__})."
         )
         # Full/SWA use the global page size, C4 uses its native compressed page,
-        # and C128 has an independent physical page size.
+        # and C128 has an independent physical page size. The DSV4.1 low-ratio
+        # latent pools (c1/c2) page at global_page_size // ratio compressed
+        # slots; a c1 pool's native page equals the global page, so it shares
+        # the default branch, while c2 needs its own native page.
         is_c4_pool = page_size * 4 == global_page_size
         is_c128_pool = page_size * 128 == global_page_size
+        is_c2_pool = page_size * 2 == global_page_size
         if is_c4_pool:
             kernel_page_size = page_size
         elif is_c128_pool:
             kernel_page_size = self.c128_page_size
+        elif is_c2_pool:
+            kernel_page_size = page_size
         else:
             kernel_page_size = global_page_size
         return NPUDeepSeekV4SingleKVPool(
@@ -341,7 +429,21 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         layer_num: int,
         device: str,
         enable_memory_saver: bool,
-    ) -> NPUDeepSeekV4IndexerPool:
+        force_fp4: bool = False,
+    ):
+        if force_fp4:
+            # DSV4.1 low compress ratios: the fp4 rounding lives in the model
+            # (rope + fake_quant_fp4 before the write), so NPU stores the
+            # already-grid-aligned values as bf16 instead of packed fp4.
+            return NPULowRatioIndexerPool(
+                size,
+                page_size,
+                dtype,
+                index_head_dim,
+                layer_num,
+                device,
+                enable_memory_saver,
+            )
         # Indexer shares C4 addresses and therefore uses the same native page.
         return NPUDeepSeekV4IndexerPool(
             size,
@@ -469,11 +571,47 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         elif item.compress_ratio == 128:
             assert not from_indexer, "c128 has no indexer pool"
             kv = self.c128_kv_pool.kv_buffer[item.compress_layer_id]
+        elif item.compress_ratio in (1, 2):
+            assert not from_indexer, "low-ratio indexer K is read via get_low_ratio_index_k_dequant"
+            compress_pool = (
+                self.c1_kv_pool
+                if item.compress_ratio == 1
+                else self.c2_kv_pool
+            )
+            assert compress_pool is not None, (
+                f"no c{item.compress_ratio} latent pool for layer {layer_id}"
+            )
+            kv = compress_pool.kv_buffer[item.compress_layer_id]
         else:
             return None
         if loc is not None:
             kv = kv.flatten(0, 1)[loc]
         return kv
+
+    def set_extra_key_buffer_fused(
+        self,
+        layer_id: int,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+    ) -> None:
+        """Low-ratio (c1/c2) latent write: the community base routes to the
+        CUDA ``fused_store_cache`` kernel, which does not exist on NPU. The
+        values are already on the fp4 grid (see the compressor's
+        ``_rope_fq4``), and bf16 represents that grid exactly, so a plain
+        scatter into the PA_ND buffer is a lossless replacement."""
+        ratio, compress_layer_id, compress_kv_pool = self.layer_mapping[layer_id]
+        assert compress_kv_pool is not None
+        if ratio not in (1, 2):
+            raise NotImplementedError(
+                "set_extra_key_buffer_fused is only overridden for DSV4.1 low "
+                f"compress ratios on NPU (layer {layer_id} has ratio {ratio})"
+            )
+        buf = compress_kv_pool.kv_buffer[compress_layer_id]
+        buf_flat = buf.flatten(0, 1)
+        kv_view = cache_k.to(buf_flat.dtype)
+        if kv_view.ndim == buf_flat.ndim - 1:
+            kv_view = kv_view.unsqueeze(1)
+        buf_flat[loc.to(torch.int64)] = kv_view
 
     def set_swa_buffer(
         self,

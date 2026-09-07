@@ -1725,6 +1725,9 @@ class MQALayer(MqaAttentionBase):
             and self.alt_streams is not None
             and x.shape[0] <= self._multi_stream_bs_limit
             and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
+            # V4.1 low ratios run through the eager low-ratio path
+            # (forward_low_ratio_sources), not the fused NPU compressor.
+            and self.compress_ratio not in (1, 2)
         )
 
         tp_slice, q_padded, q_out = slice(None), None, None

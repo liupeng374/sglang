@@ -9,6 +9,7 @@ on the FlashMLA sparse kernels.
 
 from __future__ import annotations
 
+import functools
 import os
 from typing import Optional, Tuple
 
@@ -23,6 +24,21 @@ from sglang.srt.utils import add_prefix
 _FUSED_ROPE_FQ4 = os.environ.get("SGLANG_SHALLOW_FUSED_ROPE_FQ4", "1") == "1"
 
 
+@functools.cache
+def _fused_rope_fq4_available() -> bool:
+    """The fused kernel is a CUDA kernel; non-CUDA platforms (e.g. NPU) must
+    use the eager torch pair, which is bit-exact with it."""
+    if not _FUSED_ROPE_FQ4:
+        return False
+    if not (torch.cuda.is_available() and torch.version.cuda is not None):
+        return False
+    try:
+        import sglang.kernels.ops.attention.dsv4.rope_fake_quant_fp4  # noqa: F401
+    except Exception:
+        return False
+    return True
+
+
 def _rope_fq4(x, freqs, rope_dim):
     """fake_quant_fp4(rope_tail(x, freqs, rope_dim)), fused when enabled.
 
@@ -31,7 +47,7 @@ def _rope_fq4(x, freqs, rope_dim):
     The fused kernel is bit-exact against the pair on every production shape;
     SGLANG_SHALLOW_FUSED_ROPE_FQ4=0 restores the eager path.
     """
-    if _FUSED_ROPE_FQ4:
+    if _fused_rope_fq4_available():
         from sglang.kernels.ops.attention.dsv4.rope_fake_quant_fp4 import (
             rope_tail_fake_quant_fp4,
         )

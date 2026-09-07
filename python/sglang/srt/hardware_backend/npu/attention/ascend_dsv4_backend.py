@@ -17,6 +17,11 @@ from sglang.kernels.ops.speculative.dspark.dspark_attn_metadata import (
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.ascend_backend import AscendAttnBackend
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE
+from sglang.srt.layers.attention.dsv4.dsv41_sparse import (
+    _rope_fq4,
+    last_token_per_request,
+    token_req_indices,
+)
 from sglang.srt.model_executor.forward_batch_info import DSV4OutCacheLoc, ForwardMode
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.runtime_context import get_parallel
@@ -281,6 +286,20 @@ class CompressorAscendBackendMixin:
         else:
             seq_lens_max = int(seq_lens.max().item()) if bs > 0 else 0
         for ratio in self._dsv4_unique_compress_ratios:
+            if ratio in (1, 2):
+                # DSV4.1 low ratios have no fused-compressor loc/bundle; only
+                # the attention block table over the shared latent pool is
+                # needed. Its pages line up with the full pool's (one latent
+                # page per full page), so reuse the c4 derivation.
+                if is_graph:
+                    n_c_tokens = seq_lens_max // ratio
+                else:
+                    n_c_tokens = max(1, seq_lens_max // ratio)
+                slots = req_to_token[req_pool_64, : n_c_tokens * ratio]
+                result[f"c{ratio}_page_table"] = (
+                    (slots[:, :: self.page_size] // self.page_size).to(torch.int32)
+                )
+                continue
             if ratio not in (4, 128):
                 continue
             bundle_loc = None
@@ -775,8 +794,306 @@ class C4IndexerAscendBackendMixin:
         self.forward_metadata.c4_topk_indices = topk_idxs
 
 
+class LowRatioAscendBackendMixin:
+    """DSV4.1 low compress-ratio (c1/c2) bring-up path for NPU.
+
+    Mirrors the community CUDA torch path: only kv_source layers compress into
+    the shared latent pool (bf16 storage of the fp4-grid values — every e2m1
+    grid value is exact in bf16, so the model numerics are unchanged), and
+    index_source layers score the latents with the pure-torch indexer and
+    publish top-k slots that the ``sparse_attn_sharedkv`` operator attends to.
+    Decode runs the same torch path (eager only; the fixed-shape CUDA-graph
+    decode variant is not ported).
+    """
+
+    # Cap on one bf16 [rows, heads, lc] score chunk (mirrors the CUDA torch path).
+    _LOW_RATIO_SCORE_BUDGET_BYTES = 1 << 30
+
+    @staticmethod
+    def _low_ratio_compression_metadata(
+        compress_ratio: int,
+        seq_lens_casual: torch.Tensor,
+        raw_out_loc: torch.Tensor,
+    ):
+        """A completed group's latent lives at raw_out_loc // ratio, -1 for a
+        token that completes none; topk lengths clamp at 1."""
+        num_write_tokens = raw_out_loc.shape[0]
+        causal = seq_lens_casual[:num_write_tokens]
+        completes_group = causal % compress_ratio == 0
+        out_loc = torch.where(
+            completes_group, raw_out_loc.to(torch.int64) // compress_ratio, -1
+        )
+        topk_lengths_clamp1 = (causal // compress_ratio).clamp_min(1)
+        return out_loc, topk_lengths_clamp1.to(torch.int32)
+
+    @staticmethod
+    def _select_candidate_blocks(
+        logits: torch.Tensor,
+        compress_lens: torch.Tensor,
+        topk_blocks: int,
+        block_size: int,
+    ) -> torch.Tensor:
+        """Level one of the two-level top-k (local copy of the CUDA indexer
+        helper; the upstream module pulls CUDA kernels at import time)."""
+        width = logits.size(-1)
+        scores = F.pad(logits, (0, -width % block_size), value=-torch.inf)
+        scores = scores.unflatten(-1, (-1, block_size)).amax(dim=-1)
+        num_blocks = scores.size(-1)
+        last = (compress_lens - 1) // block_size
+        scores = scores.masked_fill(
+            torch.arange(num_blocks, device=logits.device) == last, torch.inf
+        )
+        top = scores.topk(min(topk_blocks, num_blocks), dim=-1)
+        keep = torch.zeros_like(scores, dtype=torch.bool).scatter_(
+            -1, top.indices, top.values > -torch.inf
+        )
+        return keep.repeat_interleave(block_size, dim=-1)[..., :width]
+
+    def _build_low_ratio_metadata(self, forward_batch: ForwardBatch) -> None:
+        """Per-batch low-ratio metadata: out_loc (compressed slot or -1),
+        topk lengths, and the shared top-k slot buffer every index_source
+        layer of this ratio refills before its attention."""
+        fm = self.forward_metadata
+        mode = forward_batch.forward_mode
+        if mode.is_decode():
+            # seq_lens already includes the token being decoded.
+            seq_lens_casual = forward_batch.seq_lens
+        elif mode.is_extend() and not mode.is_target_verify() and not (
+            hasattr(mode, "is_draft_extend_v2") and mode.is_draft_extend_v2()
+        ):
+            # Per-token causal lengths: token at position p sees p + 1 tokens.
+            seq_lens_casual = forward_batch.positions + 1
+        else:
+            raise NotImplementedError(
+                "DSV4.1 low compress ratios on NPU support decode and plain "
+                f"prefill/extend only (got forward mode {mode})"
+            )
+        raw_out_loc = forward_batch.out_cache_loc
+        device = raw_out_loc.device
+        # The sparse-attn operator requires cmp_sparse_indices widths aligned
+        # to 128 (c4 passes its 512-wide index_topk directly); pad to that.
+        topk_width = (self._dsv4_index_topk + 127) // 128 * 128
+        for ratio in self._dsv4_low_ratios:
+            out_loc, topk_lengths = self._low_ratio_compression_metadata(
+                ratio, seq_lens_casual, raw_out_loc
+            )
+            setattr(fm, f"c{ratio}_out_loc", out_loc)
+            setattr(fm, f"c{ratio}_topk_lengths", topk_lengths)
+            setattr(
+                fm,
+                f"c{ratio}_topk_slots",
+                torch.full(
+                    (topk_lengths.shape[0], topk_width),
+                    -1,
+                    dtype=torch.int32,
+                    device=device,
+                ),
+            )
+
+    def forward_low_ratio_sources(
+        self, *, layer, x, q_lora, positions, forward_batch: ForwardBatch
+    ) -> None:
+        """Runs on every ratio 1/2 layer before its attention; the metadata and
+        latents it writes are what the layers after it attend through."""
+        if forward_batch.forward_mode.is_idle():
+            return
+        if not self._dsv4_low_ratios:
+            raise RuntimeError(
+                "layer "
+                f"{layer.layer_id} requests the V4.1 low-ratio path but the "
+                "backend has no low compress ratios configured"
+            )
+        req = token_req_indices(forward_batch)
+        pos = positions.to(torch.int64)
+        if layer.compressor is not None:
+            self._low_ratio_compress(layer, x, req, pos)
+        if layer.indexer is not None:
+            self._low_ratio_index_topk(layer, x, q_lora, req, pos)
+
+    def _low_ratio_compress(self, layer, x, req, pos) -> None:
+        pool = self.token_to_kv_pool
+        fm = self.forward_metadata
+        ratio = layer.compress_ratio
+        kv, score = layer.compressor.project(x)
+        if ratio == 1:
+            group_mask = torch.ones_like(pos, dtype=torch.bool)
+            group_pos = pos
+            pooled = kv
+            out_loc = fm.c1_out_loc
+        else:
+            odd = pos % 2 == 1
+            paired_in_batch = torch.zeros_like(odd)
+            paired_in_batch[1:] = (req[1:] == req[:-1]) & (pos[1:] == pos[:-1] + 1)
+            kv_partner = torch.empty_like(kv)
+            score_partner = torch.empty_like(score)
+            idx = (odd & paired_in_batch).nonzero().squeeze(1)
+            kv_partner[idx] = kv[idx - 1]
+            score_partner[idx] = score[idx - 1]
+            state_kv = pool.c2_pair_kv_state[layer.layer_id]
+            state_score = pool.c2_pair_score_state[layer.layer_id]
+            idx = (odd & ~paired_in_batch).nonzero().squeeze(1)
+            kv_partner[idx] = state_kv[req[idx]]
+            score_partner[idx] = state_score[req[idx]]
+            # The request's last even token waits in the state for its partner.
+            pending = last_token_per_request(~odd, req)
+            state_kv[req[pending]] = kv[pending]
+            state_score[req[pending]] = score[pending]
+            group_mask = odd
+            group_pos = pos[odd] - 1
+            pooled = layer.compressor.pool_pairs(
+                torch.stack([kv_partner[odd], kv[odd]], dim=1),
+                torch.stack([score_partner[odd], score[odd]], dim=1),
+            )
+            out_loc = fm.c2_out_loc
+        if not bool(group_mask.any()):
+            return
+        self._low_ratio_write_group(layer, pooled, out_loc[group_mask], group_pos)
+
+    def _low_ratio_write_group(self, layer, pooled, slots, group_pos) -> None:
+        pool = self.token_to_kv_pool
+        latent = layer.compressor.finish(pooled)
+        freqs = layer.freqs_cis[group_pos]
+        # Index keys come from the pre-RoPE latent, so publish them first (the
+        # NPU pool stores the fp4-grid values as bf16, which is lossless).
+        if layer.indexer is not None and layer.indexer.owns_k:
+            pool.set_index_k_fp4(
+                layer_id=layer.layer_id,
+                loc=slots,
+                cache_k=layer.indexer.index_keys(latent, freqs),
+            )
+        # Keep the latent on the fp4 grid as the reference does; _rope_fq4
+        # falls back to the eager torch pair on NPU.
+        latent = _rope_fq4(latent, freqs, layer.rope_head_dim)
+        pool.set_extra_key_buffer_fused(
+            layer_id=layer.layer_id, loc=slots, cache_k=latent
+        )
+
+    def _low_ratio_index_topk(self, layer, x, q_lora, req, pos) -> None:
+        """Torch scorer for both decode and extend: scores this layer's latent
+        source's index K and fills the shared top-k slot buffer (-1 padded)."""
+        pool = self.token_to_kv_pool
+        fm = self.forward_metadata
+        ratio = layer.compress_ratio
+        indexer = layer.indexer
+        page_indices = getattr(fm, f"c{ratio}_topk_slots")
+        page_indices.fill_(-1)
+        q = indexer.queries(q_lora, layer.freqs_cis[pos])
+        weights = indexer.head_weights(x)
+        compress_lens = (pos + 1) // ratio
+        topk = indexer.index_topk
+        assert topk <= page_indices.shape[1], (
+            f"indexer topk {topk} exceeds the buffer width {page_indices.shape[1]}"
+        )
+        publish = [] if indexer.is_candidate_source else None
+        consume = self.candidate_masks if indexer.uses_candidates else None
+        for b, r in enumerate(torch.unique_consecutive(req).tolist()):
+            tok = (req == r).nonzero().squeeze(1)
+            lens = compress_lens[tok]
+            lc = int(lens.max().item())
+            if lc == 0:
+                continue
+            j = torch.arange(lc, device=pos.device)
+            slots_j = self.req_to_token[r, j * ratio].to(torch.int64) // ratio
+            index_k = pool.get_low_ratio_index_k_dequant(layer.layer_id, slots_j)
+            k = min(topk, lc)
+            rows_per_chunk = max(
+                1, self._LOW_RATIO_SCORE_BUDGET_BYTES // (q.shape[1] * lc * 2)
+            )
+            masks = [] if publish is not None else None
+            for start in range(0, tok.numel(), rows_per_chunk):
+                rows = slice(start, start + rows_per_chunk)
+                tok_c, lens_c = tok[rows], lens[rows]
+                s = indexer.scores(q[tok_c], index_k, weights[tok_c])
+                s = s.masked_fill(j[None, :] >= lens_c[:, None], -torch.inf)
+                if masks is not None:
+                    masks.append(
+                        self._select_candidate_blocks(
+                            s,
+                            lens_c[:, None],
+                            topk_blocks=indexer.candidate_topk_blocks,
+                            block_size=indexer.candidate_block_size,
+                        )
+                    )
+                elif consume is not None:
+                    s = s.masked_fill(~consume[b][rows], -torch.inf)
+                idx = s.topk(k, dim=-1, sorted=False).indices.sort(dim=-1).values
+                reach = idx < lens_c[:, None]
+                page_indices[tok_c, :k] = torch.where(reach, slots_j[idx], -1).to(
+                    torch.int32
+                )
+            if masks is not None:
+                publish.append(torch.cat(masks) if len(masks) > 1 else masks[0])
+        if publish is not None:
+            self.candidate_masks = publish
+
+    def _forward_low_ratio(
+        self,
+        q: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        attn_sink: Optional[torch.Tensor],
+        compress_ratio: int,
+    ) -> torch.Tensor:
+        """SWA (ori branch) + sparse attention over the shared c1/c2 latent pool
+        (cmp branch, top-k slots from the torch indexer)."""
+        fm = self.forward_metadata
+        pool = self.token_to_kv_pool
+        metadata = fm.kernel_metadata.get(f"c{compress_ratio}la_metadata")
+        cmp_kv = pool.get_compress_buffer(layer.layer_id, False)
+        if metadata is None or cmp_kv is None:
+            raise RuntimeError(
+                "DeepseekV4AscendAttnBackend._forward_low_ratio: missing "
+                f"required state for layer_id={layer.layer_id} "
+                f"compress_ratio={compress_ratio}. "
+                f"metadata({'present' if metadata is not None else 'MISSING'}), "
+                f"cmp_kv({'present' if cmp_kv is not None else 'MISSING'})."
+            )
+
+        ori_kv = pool.get_swa_buffer(layer.layer_id)
+        ori_page_size = ori_kv.shape[1]
+        cmp_native_page_size = cmp_kv.shape[1]
+        expected_cmp_page_size = ori_page_size // compress_ratio
+        assert cmp_native_page_size == expected_cmp_page_size, (
+            f"c{compress_ratio} page_size={cmp_native_page_size} != "
+            f"expected={expected_cmp_page_size} for ori page_size={ori_page_size}"
+        )
+        cmp_block_table = getattr(fm, f"c{compress_ratio}_page_table")
+        topk = getattr(fm, f"c{compress_ratio}_topk_slots")
+        assert topk.shape[-1] % 128 == 0, (
+            f"cmp_sparse_indices width {topk.shape[-1]} must be 128-aligned"
+        )
+
+        attn_kwargs = dict(
+            cu_seqlens_q=fm.actual_seq_lengths_q_pa,
+            seqused_kv=fm.actual_seq_lengths_kv,
+            ori_mask_mode=4,
+            ori_win_left=self._dsv4_sliding_window_size - 1,
+            ori_win_right=0,
+            layout_q="TND",
+            layout_kv="PA_ND",
+            q=q,
+            ori_kv=ori_kv,
+            ori_block_table=fm.swa_page_table,
+            sinks=attn_sink,
+            metadata=metadata,
+            softmax_scale=layer.scaling,
+            cmp_ratio=compress_ratio,
+            cmp_mask_mode=3,
+            cmp_kv=cmp_kv,
+            cmp_block_table=cmp_block_table,
+            # top-k latent slot ids, -1 padded; one row per query token.
+            cmp_sparse_indices=topk.view(topk.shape[0], 1, topk.shape[-1]),
+        )
+        q_arg = attn_kwargs.pop("q")
+        out, _ = torch.ops.npu.sparse_attn_sharedkv(q_arg, **attn_kwargs)
+        return out
+
+
 class DeepseekV4AscendAttnBackend(
-    AscendAttnBackend, C4IndexerAscendBackendMixin, CompressorAscendBackendMixin
+    AscendAttnBackend,
+    C4IndexerAscendBackendMixin,
+    CompressorAscendBackendMixin,
+    LowRatioAscendBackendMixin,
 ):
     def __init__(
         self,
@@ -806,6 +1123,14 @@ class DeepseekV4AscendAttnBackend(
         self._dsv4_unique_compress_ratios = list(
             dict.fromkeys(self._dsv4_compress_ratios)
         )
+        # DSV4.1 low compress ratios (1/2) run through the eager torch path
+        # (LowRatioAscendBackendMixin); empty on V4 checkpoints and draft workers.
+        self._dsv4_low_ratios = sorted(
+            r for r in self._dsv4_unique_compress_ratios if r in (1, 2)
+        )
+        # Candidate masks published by candidate_source low-ratio indexers and
+        # consumed by the following index_source layers (two-level top-k).
+        self.candidate_masks = None
         self._is_dspark_algorithm = bool(
             model_runner.spec_algorithm is not None
             and model_runner.spec_algorithm.is_dspark()
@@ -820,6 +1145,17 @@ class DeepseekV4AscendAttnBackend(
             for pool in self.token_to_kv_pool.compress_state_pools
             if pool is not None
         }
+
+    def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
+        if self._dsv4_low_ratios:
+            # The low-ratio torch path has data-dependent host syncs (per-request
+            # grouping, .item() chunk bounds) that NPU-graph capture cannot run.
+            raise NotImplementedError(
+                "DSV4.1 low compress ratios (c1/c2) on NPU run through the "
+                "eager torch bring-up path and are not NPU-graph capturable; "
+                "disable NPU graph to serve them."
+            )
+        return super().init_cuda_graph_state(max_bs, max_num_tokens)
 
     def _is_dspark_draft_block(self, forward_batch: ForwardBatch) -> bool:
         spec_algorithm = forward_batch.spec_algorithm
@@ -1505,6 +1841,9 @@ class DeepseekV4AscendAttnBackend(
         if self._dsv4_compress_ratios:
             self._build_npu_compress_metadata(forward_batch)
 
+        if self._dsv4_low_ratios:
+            self._build_low_ratio_metadata(forward_batch)
+
     def _compute_kernel_metadata(self, forward_batch: ForwardBatch) -> dict:
         fm = self.forward_metadata
         if (
@@ -1620,6 +1959,19 @@ class DeepseekV4AscendAttnBackend(
                 torch.ops.custom.npu_sparse_attn_sharedkv_metadata(**c128a_kwargs)
             )
 
+        # DSV4.1 low compress ratios: the same sparse op with the latent pool's
+        # ratio and the top-k width. Key is c{ratio}la so ratio 1 never collides
+        # with the SWA c1a metadata (which has has_cmp_kv=False).
+        for ratio in self._dsv4_low_ratios:
+            la_kwargs = c1a_kwargs | {
+                "cmp_ratio": ratio,
+                "has_cmp_kv": True,
+                "cmp_topk": self._dsv4_index_topk,
+            }
+            kernel_metadata[f"c{ratio}la_metadata"] = (
+                torch.ops.custom.npu_sparse_attn_sharedkv_metadata(**la_kwargs)
+            )
+
         return kernel_metadata
 
     def forward(
@@ -1634,9 +1986,9 @@ class DeepseekV4AscendAttnBackend(
         attn_sink: Optional[torch.Tensor] = None,
         save_kv_cache: bool = True,
     ) -> torch.Tensor:
-        if compress_ratio not in (0, 4, 128):
+        if compress_ratio not in (0, 1, 2, 4, 128):
             raise ValueError(
-                f"V4 attention expects compress_ratio in (0, 4, 128); got {compress_ratio}"
+                f"V4 attention expects compress_ratio in (0, 1, 2, 4, 128); got {compress_ratio}"
             )
         # idle ranks only feed the MoE collectives; skip attn + store_cache and return zeros
         if forward_batch.forward_mode.is_idle():
@@ -1648,6 +2000,10 @@ class DeepseekV4AscendAttnBackend(
             )
         if compress_ratio == 0:
             return self._forward_swa(q, layer, forward_batch, attn_sink)
+        if compress_ratio in (1, 2):
+            return self._forward_low_ratio(
+                q, layer, forward_batch, attn_sink, compress_ratio
+            )
         return self._forward_compressed(
             q, layer, forward_batch, attn_sink, compress_ratio
         )
