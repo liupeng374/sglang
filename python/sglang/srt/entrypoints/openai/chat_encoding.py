@@ -231,13 +231,9 @@ def encode_simple_chat(
 
     Minimal encode for offline tools: no tools, no multimodal content, no
     continue_final_message; the serving path keeps its full request-level
-    pipeline in ``serving_chat``. Like
-    ``serving_chat``, an empty system message is prepended when the
-    conversation does not start with one (for the dsv4/dsv32 encoders this
-    currently renders to zero tokens, but keeping the insertion explicit ties
-    this helper to the serving semantics rather than to that coincidence).
-    dsv41 renders a system token even for empty content, so it gets no
-    implicit system message, again matching ``serving_chat``.
+    pipeline in ``serving_chat``. System-message handling matches
+    ``serving_chat``: dsv4/dsv32 get an empty one prepended, dsv41 does not
+    (it renders a system token even for empty content).
     """
     if spec == "inkling":
         from sglang.srt.parser.inkling_renderer import render_inkling_messages

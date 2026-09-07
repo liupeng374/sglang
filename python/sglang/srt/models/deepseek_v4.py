@@ -2489,10 +2489,9 @@ class DeepseekV4DecoderLayer(nn.Module):
         x_flat = x.flatten(1)
         if x.is_cuda and torch.version.cuda is not None:
             # Both kernels upcast in registers, so x_flat stays a bf16 view.
-            # The mixing GEMM and the rms statistic run batch-invariantly;
+            # The mixing GEMM and the rms statistic must run batch-invariantly:
             # cuBLAS and torch's row reduction pick their summation order from
-            # num_tokens, which made a request's logits depend on its batch
-            # mates.
+            # num_tokens, which makes a request's logits depend on its batch mates.
             mixes = hc_mix_stats(x_flat, hc_fn, self.rms_norm_eps).unsqueeze(1)
         else:
             x_flat = x_flat.float()
