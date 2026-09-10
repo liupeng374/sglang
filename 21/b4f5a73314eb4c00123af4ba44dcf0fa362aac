@@ -1,0 +1,37 @@
+python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py
+  s_1bac7f3cfcffb0::t_c68cf38008d311 2
+  s_1bac7f3cfcffb0::t_75e6c1578ad94d 839-855
+python/sglang/srt/speculative/dspark_components/dspark_draft_sampler.py
+  s_1bac7f3cfcffb0::t_13f2d78050a37f 202-217
+  s_1bac7f3cfcffb0::t_08352af7cb7d9e 17,21
+  s_1bac7f3cfcffb0::t_c77c20e18a48dc 22
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "21b4f5a73314eb4c00123af4ba44dcf0fa362aac",
+  "prompts": {},
+  "sessions": {
+    "s_1bac7f3cfcffb0": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6aa0dace9f1ffdd0413a08f3",
+        "model": "glm-5.3__dev"
+      },
+      "human_author": "liupeng <782420244@qq.com>",
+      "custom_attributes": {
+        "runtime_client": "trae-tob-git-ai",
+        "source_scene": "unknown",
+        "tool_type": "agent",
+        "edit_kind": "file_edit",
+        "operation_id": "6aa30d2d9f1ffdd0413a0fcd",
+        "tool_id": "Edit",
+        "external_session_id": "6aa0dace9f1ffdd0413a08f3",
+        "dedupe_key": "6aa0dace9f1ffdd0413a08f3:6aa30d2d9f1ffdd0413a0fcd:afterEdit:35627e17",
+        "session_id": "6aa0dace9f1ffdd0413a08f3",
+        "client_type": "ide",
+        "tool_use_id": "6aa30d2d9f1ffdd0413a0fcd"
+      }
+    }
+  }
+}
