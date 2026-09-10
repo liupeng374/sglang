@@ -1,38 +1,7 @@
-python/sglang/srt/distributed/parallel_state.py
-  s_b3410e8f8c1f31::t_8fa2d41690103b 1897,1909-1911,1922,1935-1937
-python/sglang/srt/managers/scheduler_pp_mixin.py
-  s_b3410e8f8c1f31::t_8fa2d41690103b 1170
 ---
 {
   "schema_version": "authorship/3.0.0",
   "git_ai_version": "1.6.2",
   "base_commit_sha": "f768e5b51701ebac8b2854fa058874739051c7b6",
-  "prompts": {},
-  "humans": {
-    "h_b06e15268f6732": {
-      "author": "liupeng <liupeng374@huawei.com>"
-    }
-  },
-  "sessions": {
-    "s_b3410e8f8c1f31": {
-      "agent_id": {
-        "tool": "trae",
-        "id": "6a9fff929f1ffdd0413a0841",
-        "model": "glm-5.3__dev"
-      },
-      "human_author": "liupeng <liupeng374@huawei.com>",
-      "custom_attributes": {
-        "tool_use_id": "6aa0bc6a9f1ffdd0413a08e9",
-        "display_model_name": "GLM-5.3",
-        "client_type": "ide",
-        "tool_name": "RunCommand",
-        "session_id": "6a9fff929f1ffdd0413a0841",
-        "runtime_client": "trae-tob-git-ai",
-        "operation_id": "6aa0bc6a9f1ffdd0413a08e9",
-        "source_scene": "agent",
-        "external_session_id": "6a9fff929f1ffdd0413a0841",
-        "edit_kind": "bash"
-      }
-    }
-  }
+  "prompts": {}
 }
