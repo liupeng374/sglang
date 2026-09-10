@@ -1,44 +1,7 @@
-python/sglang/srt/model_executor/model_runner_components/spec_aux_hidden_state.py
-  h_b06e15268f6732 203
-python/sglang/srt/hardware_backend/npu/attention/ascend_dsv4_backend.py
-  s_1bac7f3cfcffb0::t_a40d48b3862185 72-111
-  s_1bac7f3cfcffb0::t_69597bc84f629e 943-948
-  s_1bac7f3cfcffb0::t_8285e5b92d0ceb 1024-1028
-  s_1bac7f3cfcffb0::t_dcc9c5e806b138 2716
-  s_1bac7f3cfcffb0::t_919c79d2ffcd12 2411
-  s_1bac7f3cfcffb0::t_8be3a2fe6f927e 674,681
 ---
 {
   "schema_version": "authorship/3.0.0",
   "git_ai_version": "1.6.2",
   "base_commit_sha": "66e4a30328a68ce4debd15d3bddb3e70ce8563a4",
-  "prompts": {},
-  "humans": {
-    "h_b06e15268f6732": {
-      "author": "liupeng <liupeng374@huawei.com>"
-    }
-  },
-  "sessions": {
-    "s_1bac7f3cfcffb0": {
-      "agent_id": {
-        "tool": "trae",
-        "id": "6aa0dace9f1ffdd0413a08f3",
-        "model": "glm-5.3__dev"
-      },
-      "human_author": "liupeng <liupeng374@huawei.com>",
-      "custom_attributes": {
-        "runtime_client": "trae-tob-git-ai",
-        "source_scene": "unknown",
-        "operation_id": "6aa13cee9f1ffdd0413a0d1e",
-        "external_session_id": "6aa0dace9f1ffdd0413a08f3",
-        "tool_use_id": "6aa13cee9f1ffdd0413a0d1e",
-        "client_type": "ide",
-        "session_id": "6aa0dace9f1ffdd0413a08f3",
-        "edit_kind": "file_edit",
-        "dedupe_key": "6aa0dace9f1ffdd0413a08f3:6aa13cee9f1ffdd0413a0d1e:afterEdit:6f717a20",
-        "tool_type": "agent",
-        "tool_id": "Edit"
-      }
-    }
-  }
+  "prompts": {}
 }
