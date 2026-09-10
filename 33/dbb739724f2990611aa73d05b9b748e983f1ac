@@ -1,0 +1,41 @@
+python/sglang/srt/models/deepseek_v4_dspark.py
+  s_1bac7f3cfcffb0::t_f8de8107fb491e 5
+  s_1bac7f3cfcffb0::t_c9b2918b029c15 886-888,890-897,914-924,934-935
+  s_1bac7f3cfcffb0::t_22b252364713ee 961-971,974-981,986-992
+python/sglang/srt/hardware_backend/npu/dsv4/dsv4_memory_pool.py
+  s_1bac7f3cfcffb0::t_a5c9f7397baa13 703-717,719-726,746-753,761-779
+python/sglang/srt/speculative/dspark_components/dspark_kv_inject.py
+  s_1bac7f3cfcffb0::t_0db1ac4df3b74a 3-5,19
+  s_1bac7f3cfcffb0::t_9426f4a7045158 129-131,153-168,176-177
+  s_1bac7f3cfcffb0::t_e37d1f6011479e 54-62
+  s_1bac7f3cfcffb0::t_fbf7a295299bc8 20
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "33dbb739724f2990611aa73d05b9b748e983f1ac",
+  "prompts": {},
+  "sessions": {
+    "s_1bac7f3cfcffb0": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6aa0dace9f1ffdd0413a08f3",
+        "model": "glm-5.3__dev"
+      },
+      "human_author": "liupeng <782420244@qq.com>",
+      "custom_attributes": {
+        "source_scene": "unknown",
+        "session_id": "6aa0dace9f1ffdd0413a08f3",
+        "tool_use_id": "6aa315319f1ffdd0413a1079",
+        "client_type": "ide",
+        "edit_kind": "file_edit",
+        "tool_type": "agent",
+        "operation_id": "6aa315319f1ffdd0413a1079",
+        "tool_id": "Edit",
+        "runtime_client": "trae-tob-git-ai",
+        "dedupe_key": "6aa0dace9f1ffdd0413a08f3:6aa315319f1ffdd0413a1079:afterEdit:ffa62234",
+        "external_session_id": "6aa0dace9f1ffdd0413a08f3"
+      }
+    }
+  }
+}
