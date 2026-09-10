@@ -15,16 +15,16 @@ python/sglang/srt/layers/engram.py
       },
       "human_author": "liupeng <liupeng374@huawei.com>",
       "custom_attributes": {
-        "runtime_client": "trae-tob-git-ai",
         "external_session_id": "6a9eb59e9f1ffdd0413a0296",
-        "session_id": "6a9eb59e9f1ffdd0413a0296",
-        "tool_name": "RunCommand",
-        "client_type": "ide",
-        "edit_kind": "bash",
-        "tool_use_id": "6a9f694d9f1ffdd0413a0418",
+        "runtime_client": "trae-tob-git-ai",
         "source_scene": "agent",
-        "display_model_name": "GLM-5.3",
-        "operation_id": "6a9f694d9f1ffdd0413a0418"
+        "tool_use_id": "6a9f694d9f1ffdd0413a0418",
+        "tool_name": "RunCommand",
+        "session_id": "6a9eb59e9f1ffdd0413a0296",
+        "edit_kind": "bash",
+        "operation_id": "6a9f694d9f1ffdd0413a0418",
+        "client_type": "ide",
+        "display_model_name": "GLM-5.3"
       }
     }
   }
