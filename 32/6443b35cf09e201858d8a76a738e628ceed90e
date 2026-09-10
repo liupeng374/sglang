@@ -1,0 +1,32 @@
+python/sglang/srt/managers/scheduler_pp_mixin.py
+  s_b3410e8f8c1f31::t_b2aed9861bf293 1120
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "326443b35cf09e201858d8a76a738e628ceed90e",
+  "prompts": {},
+  "sessions": {
+    "s_b3410e8f8c1f31": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a9fff929f1ffdd0413a0841",
+        "model": "glm-5.3__dev"
+      },
+      "human_author": "liupeng <782420244@qq.com>",
+      "custom_attributes": {
+        "tool_use_id": "6aa29b389f1ffdd0413a0f5a",
+        "session_id": "6a9fff929f1ffdd0413a0841",
+        "client_type": "ide",
+        "tool_type": "agent",
+        "edit_kind": "file_edit",
+        "dedupe_key": "6a9fff929f1ffdd0413a0841:6aa29b389f1ffdd0413a0f5a:afterEdit:16abeb79",
+        "tool_id": "Edit",
+        "operation_id": "6aa29b389f1ffdd0413a0f5a",
+        "source_scene": "unknown",
+        "runtime_client": "trae-tob-git-ai",
+        "external_session_id": "6a9fff929f1ffdd0413a0841"
+      }
+    }
+  }
+}
