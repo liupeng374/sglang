@@ -1,10 +1,10 @@
-python/sglang/srt/managers/scheduler_pp_mixin.py
-  s_13e5bf3f8f5308::t_06415f7c0a9d13 611-616
-  s_13e5bf3f8f5308::t_986c0d7a427290 1138-1279
-  s_13e5bf3f8f5308::t_2b852b8b43705b 120-121,125-149,160-166,178-190,192-199
 python/sglang/srt/distributed/parallel_state.py
-  s_13e5bf3f8f5308::t_52ce935293bf75 1963-2188
+  s_13e5bf3f8f5308::t_52ce935293bf75 1963-2055,2060-2084,2089-2188
   s_13e5bf3f8f5308::t_735c6cd32f22b6 1962
+  s_13e5bf3f8f5308::t_f9fee34d2480f5 2056-2059,2085-2088
+python/sglang/srt/managers/scheduler_pp_mixin.py
+  s_b1ad389ccaaf68::t_4c7a32f3fb2dbb 125-149,160-166,178-190,192-193
+  s_b1ad389ccaaf68::t_3f13dc294671e1 194-196
 ---
 {
   "schema_version": "authorship/3.0.0",
@@ -20,18 +20,26 @@ python/sglang/srt/distributed/parallel_state.py
       },
       "human_author": "liupeng <liupeng374@huawei.com>",
       "custom_attributes": {
-        "dedupe_key": "6a85bf6bbe4e84400d235d06:6a85d94fbe4e84400d236012:afterEdit:16abeb79",
-        "source_scene": "agent",
-        "runtime_client": "trae-tob-git-ai",
-        "tool_use_id": "6a85d94fbe4e84400d236012",
-        "tool_id": "icube:applyChatSnapshotPatch",
-        "client_type": "ide",
-        "session_id": "6a85bf6bbe4e84400d235d06",
-        "operation_id": "6a85d94fbe4e84400d236012",
         "edit_kind": "file_edit",
+        "source_scene": "agent",
+        "client_type": "ide",
+        "tool_type": "builtin",
+        "session_id": "6a85bf6bbe4e84400d235d06",
+        "dedupe_key": "6a85bf6bbe4e84400d235d06:6a85d94fbe4e84400d236012:afterEdit:16abeb79",
         "external_session_id": "6a85bf6bbe4e84400d235d06",
-        "tool_type": "builtin"
+        "operation_id": "6a85d94fbe4e84400d236012",
+        "tool_use_id": "6a85d94fbe4e84400d236012",
+        "runtime_client": "trae-tob-git-ai",
+        "tool_id": "icube:applyChatSnapshotPatch"
       }
+    },
+    "s_b1ad389ccaaf68": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a85fc4bbe4e84400d23615d",
+        "model": "glm-5.3__max"
+      },
+      "human_author": "liupeng <liupeng374@huawei.com>"
     }
   }
 }
