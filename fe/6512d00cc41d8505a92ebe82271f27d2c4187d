@@ -1,7 +1,8 @@
 python/sglang/srt/layers/engram.py
   s_6841d30c509aeb::t_22c329a2eba1a5 301-304,308,311,334
   s_6841d30c509aeb::t_feb4b7630d33e5 18-20,23
-  s_6841d30c509aeb::t_1f7d53e00d48f5 21
+  s_6841d30c509aeb::t_1f7d53e00d48f5 18-21,21
+  s_6841d30c509aeb::t_48d92cc7bccdb9 334
 ---
 {
   "schema_version": "authorship/3.0.0",
@@ -22,17 +23,17 @@ python/sglang/srt/layers/engram.py
       },
       "human_author": null,
       "custom_attributes": {
-        "client_type": "ide",
-        "session_id": "6a9eb59e9f1ffdd0413a0296",
-        "tool_use_id": "6a9fa8699f1ffdd0413a064e",
-        "dedupe_key": "6a9eb59e9f1ffdd0413a0296:6a9fa8699f1ffdd0413a064e:afterEdit:31ed7fe8",
-        "source_scene": "unknown",
         "runtime_client": "trae-tob-git-ai",
-        "edit_kind": "file_edit",
-        "operation_id": "6a9fa8699f1ffdd0413a064e",
+        "tool_id": "Edit",
+        "dedupe_key": "6a9eb59e9f1ffdd0413a0296:6a9fa8699f1ffdd0413a064e:afterEdit:31ed7fe8",
         "external_session_id": "6a9eb59e9f1ffdd0413a0296",
+        "operation_id": "6a9fa8699f1ffdd0413a064e",
+        "tool_use_id": "6a9fa8699f1ffdd0413a064e",
         "tool_type": "agent",
-        "tool_id": "Edit"
+        "client_type": "ide",
+        "source_scene": "unknown",
+        "edit_kind": "file_edit",
+        "session_id": "6a9eb59e9f1ffdd0413a0296"
       }
     }
   }
