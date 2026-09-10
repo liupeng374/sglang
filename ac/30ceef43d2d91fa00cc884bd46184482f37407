@@ -1,0 +1,31 @@
+python/sglang/srt/hardware_backend/npu/dsv4/dsv4_memory_pool.py
+  s_1bac7f3cfcffb0::t_5c9fbf7c4776cf 765-767,770-814
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "ac30ceef43d2d91fa00cc884bd46184482f37407",
+  "prompts": {},
+  "sessions": {
+    "s_1bac7f3cfcffb0": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6aa0dace9f1ffdd0413a08f3",
+        "model": "glm-5.3__dev"
+      },
+      "human_author": "liupeng <782420244@qq.com>",
+      "custom_attributes": {
+        "external_session_id": "6aa0dace9f1ffdd0413a08f3",
+        "tool_use_id": "6aa316949f1ffdd0413a10bd",
+        "client_type": "ide",
+        "edit_kind": "bash",
+        "source_scene": "agent",
+        "runtime_client": "trae-tob-git-ai",
+        "session_id": "6aa0dace9f1ffdd0413a08f3",
+        "tool_name": "RunCommand",
+        "display_model_name": "GLM-5.3",
+        "operation_id": "6aa316949f1ffdd0413a10bd"
+      }
+    }
+  }
+}
