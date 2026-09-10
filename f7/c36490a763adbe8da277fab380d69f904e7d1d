@@ -24,15 +24,15 @@ python/sglang/srt/models/deepseek_v4.py
       },
       "human_author": "liupeng <liupeng374@huawei.com>",
       "custom_attributes": {
-        "tool_type": "agent",
+        "runtime_client": "trae-tob-git-ai",
+        "source_scene": "unknown",
         "client_type": "ide",
         "operation_id": "6a9f86689f1ffdd0413a0585",
-        "edit_kind": "file_edit",
         "dedupe_key": "6a9eb59e9f1ffdd0413a0296:6a9f86689f1ffdd0413a0585:afterEdit:31ed7fe8",
         "external_session_id": "6a9eb59e9f1ffdd0413a0296",
-        "runtime_client": "trae-tob-git-ai",
+        "edit_kind": "file_edit",
+        "tool_type": "agent",
         "tool_id": "Edit",
-        "source_scene": "unknown",
         "session_id": "6a9eb59e9f1ffdd0413a0296",
         "tool_use_id": "6a9f86689f1ffdd0413a0585"
       }
