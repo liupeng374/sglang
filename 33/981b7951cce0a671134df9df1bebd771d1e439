@@ -1,0 +1,32 @@
+python/sglang/srt/speculative/dspark_components/dspark_draft.py
+  s_1bac7f3cfcffb0::t_e55f858bb93cd0 4
+  s_1bac7f3cfcffb0::t_d6d2988c291a43 319-339
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "33981b7951cce0a671134df9df1bebd771d1e439",
+  "prompts": {},
+  "sessions": {
+    "s_1bac7f3cfcffb0": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6aa0dace9f1ffdd0413a08f3",
+        "model": "glm-5.3__dev"
+      },
+      "human_author": "liupeng <782420244@qq.com>",
+      "custom_attributes": {
+        "external_session_id": "6aa0dace9f1ffdd0413a08f3",
+        "operation_id": "6aa311559f1ffdd0413a1024",
+        "source_scene": "agent",
+        "edit_kind": "bash",
+        "tool_use_id": "6aa311559f1ffdd0413a1024",
+        "tool_name": "RunCommand",
+        "client_type": "ide",
+        "session_id": "6aa0dace9f1ffdd0413a08f3",
+        "runtime_client": "trae-tob-git-ai",
+        "display_model_name": "GLM-5.3"
+      }
+    }
+  }
+}
