@@ -1,34 +1,7 @@
-python/sglang/srt/managers/scheduler_pp_mixin.py
-  s_13e5bf3f8f5308::t_953ac64fc4aff5 1215-1221
-python/sglang/srt/distributed/parallel_state.py
-  s_13e5bf3f8f5308::t_f9fee34d2480f5 2056-2059,2085-2088
 ---
 {
   "schema_version": "authorship/3.0.0",
   "git_ai_version": "1.6.2",
   "base_commit_sha": "cb4754909bf0b9724513df219a1c3db9600c16a6",
-  "prompts": {},
-  "sessions": {
-    "s_13e5bf3f8f5308": {
-      "agent_id": {
-        "tool": "trae",
-        "id": "6a85bf6bbe4e84400d235d06",
-        "model": "12345"
-      },
-      "human_author": "liupeng <liupeng374@huawei.com>",
-      "custom_attributes": {
-        "runtime_client": "trae-tob-git-ai",
-        "operation_id": "6a85de4cbe4e84400d236053",
-        "edit_kind": "file_edit",
-        "external_session_id": "6a85bf6bbe4e84400d235d06",
-        "tool_use_id": "6a85de4cbe4e84400d236053",
-        "tool_id": "icube:applyChatSnapshotPatch",
-        "tool_type": "builtin",
-        "session_id": "6a85bf6bbe4e84400d235d06",
-        "source_scene": "agent",
-        "client_type": "ide",
-        "dedupe_key": "6a85bf6bbe4e84400d235d06:6a85de4cbe4e84400d236053:afterEdit:5a724aa1"
-      }
-    }
-  }
+  "prompts": {}
 }
