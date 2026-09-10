@@ -1,29 +1,7 @@
-test/registered/unit/managers/test_pp_npu_paired_p2p.py
-  s_b1ad389ccaaf68::t_9ef19d5b7b9881 1-202
-python/sglang/srt/layers/attention/dsa/dsa_npu_indexer.py
-  s_b1ad389ccaaf68::t_eb378322a29274 272-323,346-356,491-494
-python/sglang/srt/managers/scheduler_pp_mixin.py
-  s_b1ad389ccaaf68::t_4c7a32f3fb2dbb 105,126,142-148,150-157,171-177,179-183,287,305-311,338-346,370-384,465,483-489,542-551,576-590,1016-1077,1351-1352,1382,1391-1486
-python/sglang/srt/models/deepseek_v2.py
-  s_b1ad389ccaaf68::t_6815a6ecd0b651 1281-1292,1471-1478
-python/sglang/srt/hardware_backend/npu/modules/deepseek_v2_attention_mla_npu.py
-  s_b1ad389ccaaf68::t_6ba9d1eac86ce2 704-714,784-793,795-801
-python/sglang/srt/distributed/parallel_state.py
-  s_b1ad389ccaaf68::t_1bc8f4547f79aa 1814-1972
 ---
 {
   "schema_version": "authorship/3.0.0",
   "git_ai_version": "1.6.2",
   "base_commit_sha": "d4da166dd2a721ea7242a9dd9b45e9c61cf8a2cd",
-  "prompts": {},
-  "sessions": {
-    "s_b1ad389ccaaf68": {
-      "agent_id": {
-        "tool": "trae",
-        "id": "6a85fc4bbe4e84400d23615d",
-        "model": "glm-5.3__max"
-      },
-      "human_author": "liupeng <liupeng374@huawei.com>"
-    }
-  }
+  "prompts": {}
 }
