@@ -1,0 +1,17 @@
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "a24401d5dd55332b225ae42ede71c95214f71488",
+  "prompts": {},
+  "sessions": {
+    "s_b1ad389ccaaf68": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a85fc4bbe4e84400d23615d",
+        "model": "glm-5.3__max"
+      },
+      "human_author": "liupeng <liupeng374@huawei.com>"
+    }
+  }
+}
