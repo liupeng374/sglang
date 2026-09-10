@@ -1,31 +1,7 @@
-python/sglang/srt/layers/engram.py
-  s_6841d30c509aeb::t_a9f92714a4b31d 160-167
 ---
 {
   "schema_version": "authorship/3.0.0",
   "git_ai_version": "1.6.2",
   "base_commit_sha": "4a53b22e5cd6db1d35b8216c12ea5d471220c555",
-  "prompts": {},
-  "sessions": {
-    "s_6841d30c509aeb": {
-      "agent_id": {
-        "tool": "trae",
-        "id": "6a9eb59e9f1ffdd0413a0296",
-        "model": "glm-5.3__dev"
-      },
-      "human_author": "liupeng <liupeng374@huawei.com>",
-      "custom_attributes": {
-        "source_scene": "agent",
-        "display_model_name": "GLM-5.3",
-        "runtime_client": "trae-tob-git-ai",
-        "edit_kind": "bash",
-        "session_id": "6a9eb59e9f1ffdd0413a0296",
-        "operation_id": "6a9f70399f1ffdd0413a0461",
-        "external_session_id": "6a9eb59e9f1ffdd0413a0296",
-        "client_type": "ide",
-        "tool_name": "RunCommand",
-        "tool_use_id": "6a9f70399f1ffdd0413a0461"
-      }
-    }
-  }
+  "prompts": {}
 }
