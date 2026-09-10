@@ -1,32 +1,7 @@
-python/sglang/srt/hardware_backend/npu/modules/deepseek_v2_attention_mla_npu.py
-  s_e9cca1b699aae1::t_c283ea9388ffab 526-542
 ---
 {
   "schema_version": "authorship/3.0.0",
   "git_ai_version": "1.6.2",
   "base_commit_sha": "ddd724e139ff629542275ad99100bf3c973c7d52",
-  "prompts": {},
-  "sessions": {
-    "s_e9cca1b699aae1": {
-      "agent_id": {
-        "tool": "trae",
-        "id": "6a9e22719f1ffdd0413a0026",
-        "model": "glm-5.3__dev"
-      },
-      "human_author": "liupeng <liupeng374@huawei.com>",
-      "custom_attributes": {
-        "runtime_client": "trae-tob-git-ai",
-        "client_type": "ide",
-        "tool_use_id": "6a9e22c29f1ffdd0413a008a",
-        "edit_kind": "file_edit",
-        "tool_type": "agent",
-        "session_id": "6a9e22719f1ffdd0413a0026",
-        "source_scene": "unknown",
-        "external_session_id": "6a9e22719f1ffdd0413a0026",
-        "operation_id": "6a9e22c29f1ffdd0413a008a",
-        "dedupe_key": "6a9e22719f1ffdd0413a0026:6a9e22c29f1ffdd0413a008a:afterEdit:510302ad",
-        "tool_id": "Edit"
-      }
-    }
-  }
+  "prompts": {}
 }
