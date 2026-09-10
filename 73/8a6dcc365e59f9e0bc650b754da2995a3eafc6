@@ -1,33 +1,7 @@
-python/sglang/kernels/ops/speculative/ngram_embedding.py
-  s_6841d30c509aeb::t_513c3a104426e5 107-128,131-132,134-150
-  s_6841d30c509aeb::t_e2c9c97dcfc1d3 52-76
 ---
 {
   "schema_version": "authorship/3.0.0",
   "git_ai_version": "1.6.2",
   "base_commit_sha": "738a6dcc365e59f9e0bc650b754da2995a3eafc6",
-  "prompts": {},
-  "sessions": {
-    "s_6841d30c509aeb": {
-      "agent_id": {
-        "tool": "trae",
-        "id": "6a9eb59e9f1ffdd0413a0296",
-        "model": "glm-5.3__dev"
-      },
-      "human_author": "liupeng <liupeng374@huawei.com>",
-      "custom_attributes": {
-        "runtime_client": "trae-tob-git-ai",
-        "edit_kind": "file_edit",
-        "operation_id": "6a9ee4ee9f1ffdd0413a02de",
-        "tool_use_id": "6a9ee4ee9f1ffdd0413a02de",
-        "client_type": "ide",
-        "tool_id": "Edit",
-        "external_session_id": "6a9eb59e9f1ffdd0413a0296",
-        "source_scene": "unknown",
-        "tool_type": "agent",
-        "session_id": "6a9eb59e9f1ffdd0413a0296",
-        "dedupe_key": "6a9eb59e9f1ffdd0413a0296:6a9ee4ee9f1ffdd0413a02de:afterEdit:a4d06579"
-      }
-    }
-  }
+  "prompts": {}
 }
