@@ -1,32 +1,7 @@
-python/sglang/srt/model_executor/model_runner_components/spec_aux_hidden_state.py
-  s_1bac7f3cfcffb0::t_a2934223772e6a 203-231
 ---
 {
   "schema_version": "authorship/3.0.0",
   "git_ai_version": "1.6.2",
   "base_commit_sha": "a2e3dc6f158279d74084b5ea9fec4f7c71503b3c",
-  "prompts": {},
-  "sessions": {
-    "s_1bac7f3cfcffb0": {
-      "agent_id": {
-        "tool": "trae",
-        "id": "6aa0dace9f1ffdd0413a08f3",
-        "model": "glm-5.3__dev"
-      },
-      "human_author": "liupeng <liupeng374@huawei.com>",
-      "custom_attributes": {
-        "client_type": "ide",
-        "edit_kind": "file_edit",
-        "session_id": "6aa0dace9f1ffdd0413a08f3",
-        "tool_use_id": "6aa1089c9f1ffdd0413a0bb0",
-        "tool_id": "Edit",
-        "runtime_client": "trae-tob-git-ai",
-        "external_session_id": "6aa0dace9f1ffdd0413a08f3",
-        "source_scene": "unknown",
-        "tool_type": "agent",
-        "dedupe_key": "6aa0dace9f1ffdd0413a08f3:6aa1089c9f1ffdd0413a0bb0:afterEdit:4a1aff71",
-        "operation_id": "6aa1089c9f1ffdd0413a0bb0"
-      }
-    }
-  }
+  "prompts": {}
 }
