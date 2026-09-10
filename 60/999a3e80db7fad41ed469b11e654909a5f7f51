@@ -1,41 +1,7 @@
-python/sglang/srt/layers/engram.py
-  s_6841d30c509aeb::t_b7dfdebcf8d822 409-411,413
-  s_6841d30c509aeb::t_48d92cc7bccdb9 326,334-352
-  s_6841d30c509aeb::t_1f7d53e00d48f5 20-25
-python/sglang/srt/models/deepseek_v4.py
-  s_6841d30c509aeb::t_13bb2be156245e 3269-3271
 ---
 {
   "schema_version": "authorship/3.0.0",
   "git_ai_version": "1.6.2",
   "base_commit_sha": "60999a3e80db7fad41ed469b11e654909a5f7f51",
-  "prompts": {},
-  "humans": {
-    "h_b06e15268f6732": {
-      "author": "liupeng <liupeng374@huawei.com>"
-    }
-  },
-  "sessions": {
-    "s_6841d30c509aeb": {
-      "agent_id": {
-        "tool": "trae",
-        "id": "6a9eb59e9f1ffdd0413a0296",
-        "model": "glm-5.3__dev"
-      },
-      "human_author": "liupeng <liupeng374@huawei.com>",
-      "custom_attributes": {
-        "tool_id": "Edit",
-        "source_scene": "unknown",
-        "operation_id": "6a9f86689f1ffdd0413a0585",
-        "tool_use_id": "6a9f86689f1ffdd0413a0585",
-        "tool_type": "agent",
-        "external_session_id": "6a9eb59e9f1ffdd0413a0296",
-        "session_id": "6a9eb59e9f1ffdd0413a0296",
-        "client_type": "ide",
-        "runtime_client": "trae-tob-git-ai",
-        "edit_kind": "file_edit",
-        "dedupe_key": "6a9eb59e9f1ffdd0413a0296:6a9f86689f1ffdd0413a0585:afterEdit:31ed7fe8"
-      }
-    }
-  }
+  "prompts": {}
 }
