@@ -22,16 +22,16 @@ python/sglang/srt/managers/scheduler_pp_mixin.py
       },
       "human_author": "liupeng <liupeng374@huawei.com>",
       "custom_attributes": {
-        "tool_name": "RunCommand",
-        "external_session_id": "6a9fff929f1ffdd0413a0841",
-        "display_model_name": "GLM-5.3",
-        "operation_id": "6aa0bc6a9f1ffdd0413a08e9",
+        "runtime_client": "trae-tob-git-ai",
         "edit_kind": "bash",
+        "display_model_name": "GLM-5.3",
+        "tool_use_id": "6aa0bc6a9f1ffdd0413a08e9",
+        "tool_name": "RunCommand",
         "session_id": "6a9fff929f1ffdd0413a0841",
         "client_type": "ide",
         "source_scene": "agent",
-        "tool_use_id": "6aa0bc6a9f1ffdd0413a08e9",
-        "runtime_client": "trae-tob-git-ai"
+        "external_session_id": "6a9fff929f1ffdd0413a0841",
+        "operation_id": "6aa0bc6a9f1ffdd0413a08e9"
       }
     }
   }
