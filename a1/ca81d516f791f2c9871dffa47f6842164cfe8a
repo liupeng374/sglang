@@ -1,46 +1,7 @@
-python/sglang/kernels/ops/memory/allocator_npu.py
-  s_3531c5ab43f3a8::t_7097e1533fb690 141-153,159,161,163,166,170-173,175-206,210-224
-  s_3531c5ab43f3a8::t_0d4f2265fb28ec 15-16
-  s_3531c5ab43f3a8::t_0f4335df2c822b 96,98,104,111,119-120,139-140,154-158,160,162,164-165,174,207-209
-  s_3531c5ab43f3a8::t_b51f7c78101659 93-95,97,99-103,105-110,112-118,121-138
-  s_3531c5ab43f3a8::t_d592e9fdda2bba 167-169
-python/sglang/srt/mem_cache/pool_host/mla.py
-  h_b06e15268f6732 622-623,625
-python/sglang/srt/hardware_backend/npu/allocator_npu.py
-  s_3531c5ab43f3a8::t_7151dc5a204c7d 28-32
-  s_3531c5ab43f3a8::t_3a8889ba357dec 163-166,168-173,175-180
 ---
 {
   "schema_version": "authorship/3.0.0",
   "git_ai_version": "1.6.2",
   "base_commit_sha": "a1ca81d516f791f2c9871dffa47f6842164cfe8a",
-  "prompts": {},
-  "humans": {
-    "h_b06e15268f6732": {
-      "author": "liupeng <liupeng374@huawei.com>"
-    }
-  },
-  "sessions": {
-    "s_3531c5ab43f3a8": {
-      "agent_id": {
-        "tool": "trae",
-        "id": "6a952a5d4083bdaa0011cde7",
-        "model": "glm-5.3__dev"
-      },
-      "human_author": "liupeng <liupeng374@huawei.com>",
-      "custom_attributes": {
-        "client_type": "ide",
-        "external_session_id": "6a952a5d4083bdaa0011cde7",
-        "source_scene": "unknown",
-        "operation_id": "6a9538804083bdaa0011ceab",
-        "tool_id": "Edit",
-        "runtime_client": "trae-tob-git-ai",
-        "dedupe_key": "6a952a5d4083bdaa0011cde7:6a9538804083bdaa0011ceab:afterEdit:b09a9f53",
-        "edit_kind": "file_edit",
-        "session_id": "6a952a5d4083bdaa0011cde7",
-        "tool_type": "agent",
-        "tool_use_id": "6a9538804083bdaa0011ceab"
-      }
-    }
-  }
+  "prompts": {}
 }
