@@ -1,51 +1,7 @@
-python/sglang/srt/models/deepseek_v4.py
-  s_1799ddcdf09d72::t_3f72b63a725bed 1728-1730
-python/sglang/srt/hardware_backend/npu/attention/ascend_dsv4_backend.py
-  s_1799ddcdf09d72::t_2c11aa917c6699 1093-1096
-  s_1799ddcdf09d72::t_1353fdf2c2f440 289-301
-  s_1799ddcdf09d72::t_574f6a0e859bf5 1962-1974
-  s_1799ddcdf09d72::t_537b590f17bdc0 1989,1991,2003-2006
-  s_1799ddcdf09d72::t_380a93711b90e4 1126-1133
-  s_1799ddcdf09d72::t_a3c2174010a306 1844-1846
-  s_1799ddcdf09d72::t_b775dbbede773e 302,797-872,876-885,887-1091
-  s_1799ddcdf09d72::t_662e455c79d69e 1149-1159
-  s_1799ddcdf09d72::t_ee641123ae46aa 873-875,886
-  s_1799ddcdf09d72::t_413dea458de18f 20-24
-python/sglang/srt/layers/attention/dsv4/dsv41_sparse.py
-  s_1799ddcdf09d72::t_d7492effc3e637 12,27-41,50
-python/sglang/srt/hardware_backend/npu/dsv4/dsv4_memory_pool.py
-  s_1799ddcdf09d72::t_09de68af414a72 350-353,356,361-362
-  s_1799ddcdf09d72::t_97a8c8d7b429bf 432-446
-  s_1799ddcdf09d72::t_6fb7469c0aab6d 574-584,591-614
-  s_1799ddcdf09d72::t_3337c8520a54e0 225-306
-  s_1799ddcdf09d72::t_5a1916e8778f1b 615
 ---
 {
   "schema_version": "authorship/3.0.0",
   "git_ai_version": "1.6.2",
   "base_commit_sha": "b6fc285f4fff83747212b64ea75d621ed9c5f659",
-  "prompts": {},
-  "sessions": {
-    "s_1799ddcdf09d72": {
-      "agent_id": {
-        "tool": "trae",
-        "id": "6a9e669f9f1ffdd0413a0094",
-        "model": "glm-5.3__dev"
-      },
-      "human_author": "liupeng <liupeng374@huawei.com>",
-      "custom_attributes": {
-        "external_session_id": "6a9e669f9f1ffdd0413a0094",
-        "tool_id": "Edit",
-        "edit_kind": "file_edit",
-        "client_type": "ide",
-        "source_scene": "unknown",
-        "tool_use_id": "6a9e8c2f9f1ffdd0413a0278",
-        "tool_type": "agent",
-        "dedupe_key": "6a9e669f9f1ffdd0413a0094:6a9e8c2f9f1ffdd0413a0278:afterEdit:31ed7fe8",
-        "session_id": "6a9e669f9f1ffdd0413a0094",
-        "runtime_client": "trae-tob-git-ai",
-        "operation_id": "6a9e8c2f9f1ffdd0413a0278"
-      }
-    }
-  }
+  "prompts": {}
 }
