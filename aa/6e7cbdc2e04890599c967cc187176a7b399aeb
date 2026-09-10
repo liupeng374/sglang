@@ -1,35 +1,7 @@
-python/sglang/srt/mem_cache/hiradix_cache.py
-  s_5f917da706a491::t_ec5eb050bfc38b 1231,1233,1242-1243,1245,1253-1255,1267
-  s_5f917da706a491::t_3683f679e8f9c3 1232,1234-1241,1244
-  s_5f917da706a491::t_59bdf0406fd42c 1278-1279
-  s_5f917da706a491::t_40fa07ca5c8a5e 1309
 ---
 {
   "schema_version": "authorship/3.0.0",
   "git_ai_version": "1.6.2",
   "base_commit_sha": "aa6e7cbdc2e04890599c967cc187176a7b399aeb",
-  "prompts": {},
-  "sessions": {
-    "s_5f917da706a491": {
-      "agent_id": {
-        "tool": "trae",
-        "id": "6a9191c9cc93210cc8d4fed9",
-        "model": "glm-5.3__dev"
-      },
-      "human_author": "liupeng <liupeng374@huawei.com>",
-      "custom_attributes": {
-        "external_session_id": "6a9191c9cc93210cc8d4fed9",
-        "tool_type": "agent",
-        "tool_use_id": "6a9294004083bdaa0011ca51",
-        "operation_id": "6a9294004083bdaa0011ca51",
-        "runtime_client": "trae-tob-git-ai",
-        "tool_id": "Edit",
-        "source_scene": "unknown",
-        "edit_kind": "file_edit",
-        "session_id": "6a9191c9cc93210cc8d4fed9",
-        "dedupe_key": "6a9191c9cc93210cc8d4fed9:6a9294004083bdaa0011ca51:afterEdit:d12083a1",
-        "client_type": "ide"
-      }
-    }
-  }
+  "prompts": {}
 }
