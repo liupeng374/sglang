@@ -1,7 +1,6 @@
 python/sglang/srt/layers/engram.py
-  s_6841d30c509aeb::t_22c329a2eba1a5 301-304,308,311,334
-  s_6841d30c509aeb::t_feb4b7630d33e5 18-20,23
-  s_6841d30c509aeb::t_1f7d53e00d48f5 21
+  s_6841d30c509aeb::t_1f7d53e00d48f5 18-21
+  s_6841d30c509aeb::t_48d92cc7bccdb9 334
 ---
 {
   "schema_version": "authorship/3.0.0",
@@ -20,19 +19,18 @@ python/sglang/srt/layers/engram.py
         "id": "6a9eb59e9f1ffdd0413a0296",
         "model": "glm-5.3__dev"
       },
-      "human_author": null,
+      "human_author": "liupeng <liupeng374@huawei.com>",
       "custom_attributes": {
-        "session_id": "6a9eb59e9f1ffdd0413a0296",
-        "edit_kind": "file_edit",
-        "client_type": "ide",
-        "tool_type": "agent",
-        "dedupe_key": "6a9eb59e9f1ffdd0413a0296:6a9fa8699f1ffdd0413a064e:afterEdit:31ed7fe8",
-        "source_scene": "unknown",
-        "tool_use_id": "6a9fa8699f1ffdd0413a064e",
+        "tool_name": "RunCommand",
+        "edit_kind": "bash",
         "runtime_client": "trae-tob-git-ai",
-        "operation_id": "6a9fa8699f1ffdd0413a064e",
+        "client_type": "ide",
+        "session_id": "6a9eb59e9f1ffdd0413a0296",
         "external_session_id": "6a9eb59e9f1ffdd0413a0296",
-        "tool_id": "Edit"
+        "tool_use_id": "6a9fadb59f1ffdd0413a0671",
+        "operation_id": "6a9fadb59f1ffdd0413a0671",
+        "source_scene": "agent",
+        "display_model_name": "GLM-5.3"
       }
     }
   }
