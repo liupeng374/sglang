@@ -1,0 +1,19 @@
+python/sglang/srt/managers/scheduler_pp_mixin.py
+  s_b1ad389ccaaf68::t_4c7a32f3fb2dbb 126,142-147
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "4913bd8a3aee7746d2e161cd48b5b5c6b99a8047",
+  "prompts": {},
+  "sessions": {
+    "s_b1ad389ccaaf68": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a85fc4bbe4e84400d23615d",
+        "model": "glm-5.3__max"
+      },
+      "human_author": "liupeng <liupeng374@huawei.com>"
+    }
+  }
+}
