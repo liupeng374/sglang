@@ -1,57 +1,7 @@
-python/sglang/srt/hardware_backend/npu/dsv4/dsv4_memory_pool.py
-  s_1bac7f3cfcffb0::t_5503a9a5c4887f 880-885
-  s_1bac7f3cfcffb0::t_7d7e18ba5d9353 40-66
-  s_1bac7f3cfcffb0::t_90119337a760c8 18
-  s_1bac7f3cfcffb0::t_5ae857ffbb3f0c 817-826
-  s_1bac7f3cfcffb0::t_8cde1b83730b61 737-742
-  s_1bac7f3cfcffb0::t_bfcb91f77efd3f 772-774
-python/sglang/srt/layers/attention/dsv4/dsv41_compressor.py
-  s_1bac7f3cfcffb0::t_9c30d1d1c14b66 71-76
-  s_1bac7f3cfcffb0::t_6d1468d3ca7856 5
-python/sglang/srt/speculative/dspark_components/dspark_planner.py
-  s_1bac7f3cfcffb0::t_0a2fde409f3a3a 835-855
-  s_1bac7f3cfcffb0::t_eb3d018e39d61e 4
-python/sglang/srt/managers/scheduler.py
-  s_1bac7f3cfcffb0::t_e28d902a18530c 4201-4207
-  s_1bac7f3cfcffb0::t_f240ae2cc3cd9b 4304-4310
-python/sglang/srt/managers/overlap_utils.py
-  s_1bac7f3cfcffb0::t_228d21698633a6 597-605
-  s_1bac7f3cfcffb0::t_0d43f3cb6e973d 537-541,547-552
-  s_1bac7f3cfcffb0::t_7d3b57a6fdef1e 73-77
-  s_1bac7f3cfcffb0::t_e62ed01032abc9 3-4
-  s_1bac7f3cfcffb0::t_1303de18ccba18 553
-python/sglang/srt/hardware_backend/npu/attention/ascend_dsv4_backend.py
-  s_1bac7f3cfcffb0::t_4e2c28f470be6a 2432-2434
-  s_1bac7f3cfcffb0::t_04ea57e1940b29 97-98,105-110
-  s_1bac7f3cfcffb0::t_98a3aedb12af0b 2747
-  s_1bac7f3cfcffb0::t_907e141f98fa02 1012-1032,1034
 ---
 {
   "schema_version": "authorship/3.0.0",
   "git_ai_version": "1.6.2",
   "base_commit_sha": "4b07480b1d9f8ee962de400760a144cf3bc72087",
-  "prompts": {},
-  "sessions": {
-    "s_1bac7f3cfcffb0": {
-      "agent_id": {
-        "tool": "trae",
-        "id": "6aa0dace9f1ffdd0413a08f3",
-        "model": "glm-5.3__dev"
-      },
-      "human_author": "liupeng <liupeng374@huawei.com>",
-      "custom_attributes": {
-        "external_session_id": "6aa0dace9f1ffdd0413a08f3",
-        "operation_id": "6aa15b8f9f1ffdd0413a0f17",
-        "session_id": "6aa0dace9f1ffdd0413a08f3",
-        "source_scene": "unknown",
-        "edit_kind": "file_edit",
-        "tool_use_id": "6aa15b8f9f1ffdd0413a0f17",
-        "tool_id": "Edit",
-        "runtime_client": "trae-tob-git-ai",
-        "tool_type": "agent",
-        "client_type": "ide",
-        "dedupe_key": "6aa0dace9f1ffdd0413a08f3:6aa15b8f9f1ffdd0413a0f17:afterEdit:1665f36f"
-      }
-    }
-  }
+  "prompts": {}
 }
