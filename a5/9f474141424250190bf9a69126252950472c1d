@@ -1,36 +1,7 @@
-python/sglang/srt/mem_cache/hiradix_cache.py
-  s_5f917da706a491::t_a65914a1d84741 1263-1267,1274,1283,1290,1293-1294
-  s_5f917da706a491::t_2b04031911df7a 1310,1313,1316,1321-1322,1324
-  s_5f917da706a491::t_f571b6e8a28299 1238-1242,1248,1250,1252-1253
-  s_5f917da706a491::t_7ece9585de8d4b 1327-1329
-  s_5f917da706a491::t_cf67e2885eb5fa 1354
 ---
 {
   "schema_version": "authorship/3.0.0",
   "git_ai_version": "1.6.2",
   "base_commit_sha": "a59f474141424250190bf9a69126252950472c1d",
-  "prompts": {},
-  "sessions": {
-    "s_5f917da706a491": {
-      "agent_id": {
-        "tool": "trae",
-        "id": "6a9191c9cc93210cc8d4fed9",
-        "model": "glm-5.3"
-      },
-      "human_author": "liupeng <liupeng374@huawei.com>",
-      "custom_attributes": {
-        "session_id": "6a9191c9cc93210cc8d4fed9",
-        "tool_type": "builtin",
-        "runtime_client": "trae-tob-git-ai",
-        "operation_id": "6a927a6bcc93210cc8d50014",
-        "edit_kind": "file_edit",
-        "external_session_id": "6a9191c9cc93210cc8d4fed9",
-        "dedupe_key": "6a9191c9cc93210cc8d4fed9:6a927a6bcc93210cc8d50014:afterEdit:d12083a1",
-        "source_scene": "agent",
-        "tool_id": "icube:applyChatSnapshotPatch",
-        "client_type": "ide",
-        "tool_use_id": "6a927a6bcc93210cc8d50014"
-      }
-    }
-  }
+  "prompts": {}
 }
