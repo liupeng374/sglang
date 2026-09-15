@@ -1,0 +1,52 @@
+python/sglang/srt/managers/scheduler_pp_mixin.py
+  s_d79f328cf9475d::t_225d99b38b3d3a 56-71
+  s_d79f328cf9475d::t_3e1e62bf2140c8 1199
+  s_d79f328cf9475d::t_99566ef5750ded 598-604
+  s_d79f328cf9475d::t_5b015db9b30617 1220-1221
+  s_d79f328cf9475d::t_af025bea238e50 588-597,605-620
+  s_d79f328cf9475d::t_25538b5e992abc 952-974
+  s_d79f328cf9475d::t_aa633274ffabef 1065-1071,1074
+python/sglang/srt/environ.py
+  s_d79f328cf9475d::t_28aac8daf6ef17 636-641,646
+  s_d79f328cf9475d::t_53b01132db9b02 642-645
+python/sglang/srt/distributed/parallel_state.py
+  s_d79f328cf9475d::t_7d474b30360621 1935
+  s_d79f328cf9475d::t_c6440ac079ca62 1760-1767
+  s_d79f328cf9475d::t_c24779264e3fd7 1811-1812,1815
+  s_d79f328cf9475d::t_6aac21cae88f23 120-134
+  s_d79f328cf9475d::t_aa1f447fc90923 1965
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "761c7a7f6e7bea8565daaa67aec8a580961df84d",
+  "prompts": {},
+  "humans": {
+    "h_30a34a661c3284": {
+      "author": "liupeng <782420244@qq.com>"
+    }
+  },
+  "sessions": {
+    "s_d79f328cf9475d": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6aa8b5b19f1ffdd0413a1330",
+        "model": "glm-5.3__dev"
+      },
+      "human_author": "liupeng <782420244@qq.com>",
+      "custom_attributes": {
+        "session_id": "6aa8b5b19f1ffdd0413a1330",
+        "client_type": "ide",
+        "dedupe_key": "6aa8b5b19f1ffdd0413a1330:6aa8f1fd9f1ffdd0413a1426:afterEdit:aaf817ad",
+        "tool_type": "agent",
+        "source_scene": "unknown",
+        "runtime_client": "trae-tob-git-ai",
+        "operation_id": "6aa8f1fd9f1ffdd0413a1426",
+        "edit_kind": "file_edit",
+        "tool_use_id": "6aa8f1fd9f1ffdd0413a1426",
+        "tool_id": "Edit",
+        "external_session_id": "6aa8b5b19f1ffdd0413a1330"
+      }
+    }
+  }
+}
