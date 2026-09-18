@@ -7,6 +7,22 @@ from sglang.srt.configs.mamba_utils import KimiLinearCacheParams, KimiLinearStat
 from sglang.srt.runtime_context import get_parallel
 
 
+def kda_shard_tp_size() -> int:
+    """TP width the KDA (linear-attention) layers head-shard over.
+
+    Matches the shared-experts TP width under pure DP attention: with
+    attn_tp == 1 and an explicit shared-experts TP width, the KDA weights
+    shard over the shared-experts group instead of being replicated
+    (see kimi_k3._kda_shared_experts_attn_tp); the mamba state cache sizes
+    its local head count with the same rule, so they stay consistent.
+    """
+    parallel = get_parallel()
+    shared_tp = parallel.shared_experts_tp_size
+    if parallel.attn_tp_size == 1 and shared_tp is not None and shared_tp > 1:
+        return shared_tp
+    return parallel.attn_tp_size
+
+
 class KimiLinearConfig(PretrainedConfig):
     model_type = "kimi_linear"
     keys_to_ignore_at_inference = ["past_key_values"]
@@ -184,7 +200,7 @@ class KimiLinearConfig(PretrainedConfig):
     def mamba2_cache_params(self) -> KimiLinearCacheParams:
 
         shape = KimiLinearStateShape.create(
-            tp_world_size=get_parallel().attn_tp_size,
+            tp_world_size=kda_shard_tp_size(),
             num_heads=self.linear_attn_config["num_heads"],
             head_dim=self.linear_attn_config["head_dim"],
             conv_kernel_size=self.linear_attn_config["short_conv_kernel_size"],

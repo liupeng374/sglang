@@ -2641,7 +2641,24 @@ def initialize_model_parallel(
             // attention_data_parallel_size
             // attention_context_model_parallel_size
         )
-        if (
+        # Pure DP attention (attn_width == 1): allow the shared-experts group
+        # to span the full TP group (one DP domain per rank) — the KDA layers
+        # head-shard over it (kimi_k3._kda_shared_experts_attn_tp), matching
+        # the shared-expert sharding. Anywhere else the width must divide the
+        # attention TP width so the group nests inside one attn-TP group.
+        if attn_width == 1:
+            if (
+                shared_experts_tensor_parallel_size < 1
+                or tensor_model_parallel_size
+                % shared_experts_tensor_parallel_size
+                != 0
+            ):
+                raise ValueError(
+                    "Under pure DP attention, shared-expert TP size must be "
+                    "a positive divisor of the TP size "
+                    f"({tensor_model_parallel_size})."
+                )
+        elif (
             shared_experts_tensor_parallel_size < 1
             or attn_width % shared_experts_tensor_parallel_size != 0
         ):

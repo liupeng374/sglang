@@ -114,6 +114,19 @@ class DpPaddingMode(IntEnum):
         if moe_a2a_backend.is_deepep_v2() and envs.SGLANG_DEEPEP_V2_FORCE_MAX_LEN.get():
             return DpPaddingMode.MAX_LEN
 
+        # KDA shard mode (pure DP attention + explicit shared-experts TP
+        # width): the KDA layers all-gather / reduce-scatter rows on the
+        # shared-experts group (see kimi_k3._kda_gather_rows), which
+        # requires equal row counts on every rank — force MAX_LEN so all
+        # DP ranks pad to the same token count.
+        parallel = get_parallel()
+        if (
+            parallel.attn_tp_size == 1
+            and parallel.shared_experts_tp_size is not None
+            and parallel.shared_experts_tp_size > 1
+        ):
+            return DpPaddingMode.MAX_LEN
+
         # When is_extend_in_batch and dp_size > 1, use SUM_LEN to avoid padding
         # overhead from uneven token distribution.
         # For dp_size=1, max_len equals sum_len, so prefer MAX_LEN mode

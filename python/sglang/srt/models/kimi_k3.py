@@ -6,9 +6,11 @@
 #   - MLA output gate (mla_use_output_gate)
 #   - Full-rank KDA gate (use_full_rank_gate)
 
+import copy
 import logging
 import os
 from collections.abc import Iterable
+from contextlib import contextmanager
 from functools import cached_property
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
@@ -1581,6 +1583,181 @@ class KimiK3MoE(nn.Module):
         return out.view(num_tokens, hidden_size)
 
 
+@contextmanager
+def _kda_shared_experts_attn_tp():
+    """Point attn_tp at the shared-experts TP group for KDA construction.
+
+    Under pure DP attention (attn_tp == 1) the KDA layer would otherwise be
+    weight-replicated on every rank; with an explicit shared-experts TP
+    width it head-shards over the shared-experts group instead, matching the
+    shared-expert sharding. KimiLinearConfig.mamba2_cache_params applies the
+    same width rule, so the mamba state cache sizes the local head count to
+    match. Forward-time communication for the shard (gather / reduce-scatter
+    around the KDA core) runs on the shared-experts group as well.
+
+    Yields the shared-experts group when the mode is active, else None.
+    """
+    parallel = get_parallel()
+    shared_tp = parallel.shared_experts_tp_size
+    if parallel.attn_tp_size == 1 and shared_tp is not None and shared_tp > 1:
+        group = get_shared_experts_tp_group()
+        assert group is not None and group.world_size == shared_tp, (
+            f"shared-experts TP group not built at width {shared_tp}"
+        )
+        with parallel.override(
+            attn_tp_size=group.world_size,
+            attn_tp_rank=group.rank_in_group,
+        ):
+            yield group
+    else:
+        yield None
+
+
+def _kda_gather_rows(hidden_states: torch.Tensor, group) -> torch.Tensor:
+    """Shared-experts-style row all-gather (see _gather_shared_expert_inputs):
+    rank r's rows land at [r*T, (r+1)*T). Requires equal row counts across the
+    group — same contract as the shared experts (MAX_LEN-padded / CUDA-graph
+    batches); unequal DP-local sizes are not handled yet."""
+    with use_symmetric_memory(group, disabled=not is_allocation_symmetric()):
+        gathered = hidden_states.new_empty(
+            (hidden_states.shape[0] * group.world_size, *hidden_states.shape[1:])
+        )
+    group.all_gather_into_tensor(gathered, hidden_states)
+    return gathered
+
+
+def _kda_reduce_scatter_rows(
+    partial_out: torch.Tensor, like: torch.Tensor, group
+) -> torch.Tensor:
+    """Shared-experts-style reduce-scatter (see _reduce_scatter_shared_experts):
+    sum the TP-partial o_proj output across the shard group and split it back
+    to each rank's own rows — the split boundaries align with the all-gather
+    layout, so rank r gets exactly its rows' full sum."""
+    out = like.new_empty(like.shape)
+    group.reduce_scatter_tensor(out, partial_out)
+    return out
+
+
+def _kda_gathered_forward_batch(
+    forward_batch: ForwardBatch, group, num_rows: int
+):
+    """Structural per-request metadata view of the KDA all-gathered batch.
+
+    Requires the forced-MAX_LEN padding (DpPaddingMode.get_dp_padding_mode):
+    every rank contributes exactly `num_rows` rows, rank r's rows landing at
+    [r*num_rows, (r+1)*num_rows). Each per-req array is padded to a common
+    per-rank request count first (mode-dependent, below), then all-gathered.
+    Dummy and foreign requests resolve to req id 0 on this rank's pools
+    (in-range garbage — state correctness belongs to the global mamba slot
+    space and is intentionally out of scope here).
+
+    Per-mode request count and row mapping:
+    - decode/idle: one token per request -> count == num_rows; the backend's
+      arange(bs + 1) query_start_loc matches the gathered block layout
+      (request j <-> row j) exactly.
+    - target_verify (chain): draft_token_num rows per request -> count ==
+      num_rows // draft_token_num; the backend derives query_start_loc as
+      arange(0, input_ids.shape[0] + 1, draft_token_num), so the shim
+      presents a gathered-row-count input_ids stand-in. _pad_inputs_to_size
+      already padded the local per-req arrays to this count under MAX_LEN.
+    - extend: dummy requests absorb the padding rows (the first dummy takes
+      the remainder, the rest are zero-len) so every rank's lens sum to
+      num_rows -> count == num_rows; the recomputed cumsum start offsets are
+      block-aligned with the row gather.
+    """
+    ws = group.world_size
+    mode = forward_batch.forward_mode
+
+    if mode.is_target_verify():
+        spec = forward_batch.spec_info
+        if (
+            spec is None
+            or spec.ragged_verify_layout is not None
+            or getattr(spec, "retrieve_next_token", None) is not None
+        ):
+            raise NotImplementedError(
+                "KDA shared-experts shard mode supports chain target_verify "
+                "(uniform draft_token_num) only: ragged verify layouts and "
+                "tree links (retrieve_next_token) are per-rank and not "
+                "gathered yet."
+            )
+        req_count = num_rows // spec.draft_token_num
+        assert num_rows % spec.draft_token_num == 0, (
+            f"KDA shard verify padding: {num_rows=} not divisible by "
+            f"{spec.draft_token_num=}"
+        )
+    else:
+        req_count = num_rows
+
+    def pad_to_count(t: Optional[torch.Tensor], fill=0) -> Optional[torch.Tensor]:
+        if t is None:
+            return None
+        if t.shape[0] == req_count:
+            return t
+        out = t.new_full((req_count, *t.shape[1:]), fill)
+        if t.shape[0] > 0:
+            out[: t.shape[0]] = t
+        return out
+
+    def gather_req(t: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        if t is None:
+            return None
+        gathered = t.new_empty((req_count * ws, *t.shape[1:]))
+        group.all_gather_into_tensor(gathered, t)
+        return gathered
+
+    fb = copy.copy(forward_batch)
+    fb.batch_size = req_count * ws
+    fb._original_batch_size = fb.batch_size
+    fb.req_pool_indices = gather_req(pad_to_count(forward_batch.req_pool_indices))
+    fb.seq_lens = gather_req(pad_to_count(forward_batch.seq_lens))
+    if fb.seq_lens is not None and forward_batch.seq_lens_cpu is not None:
+        fb.seq_lens_cpu = fb.seq_lens.cpu().tolist()
+    # MAX_LEN padding semantics don't carry into the gathered layout (the
+    # per-rank pads are interleaved, not a suffix); RadixLinearAttention's
+    # trim path must not narrow the gathered rows.
+    fb.num_token_non_padded = None
+    fb.num_token_non_padded_cpu = None
+    fb.mamba_track_indices = gather_req(
+        pad_to_count(forward_batch.mamba_track_indices)
+    )
+    fb.mamba_track_mask = gather_req(pad_to_count(forward_batch.mamba_track_mask))
+
+    if mode.is_target_verify():
+        # The uniform-chain query_start_loc is derived from
+        # arange(0, input_ids.shape[0] + 1, draft_token_num) — present the
+        # GATHERED row count via a shape-only input_ids stand-in (values are
+        # not read on the KDA verify path).
+        fb.input_ids = forward_batch.input_ids.new_empty(
+            (num_rows * ws,) + forward_batch.input_ids.shape[1:]
+        )
+    elif not mode.is_decode_or_idle():
+        # Extend family: pad the per-request lens to cover all num_rows rows
+        # (the first dummy absorbs the padding rows, the rest are zero-len),
+        # so each rank's lens sum to num_rows and the recomputed cumsum start
+        # offsets stay block-aligned with the row gather.
+        lens = forward_batch.extend_seq_lens
+        if lens is not None:
+            bs = lens.shape[0]
+            padded_lens = lens.new_zeros(req_count)
+            if bs > 0:
+                padded_lens[:bs] = lens
+            real_rows = sum(forward_batch.extend_seq_lens_cpu or [])
+            if 0 < num_rows - real_rows and bs < req_count:
+                padded_lens[bs] = num_rows - real_rows
+            gathered_lens = gather_req(padded_lens)
+            fb.extend_seq_lens = gathered_lens
+            if gathered_lens is not None:
+                fb.extend_start_loc = (
+                    torch.cumsum(gathered_lens, dim=0) - gathered_lens
+                )
+                fb.extend_seq_lens_cpu = gathered_lens.cpu().tolist()
+            fb.extend_prefix_lens = gather_req(
+                pad_to_count(forward_batch.extend_prefix_lens)
+            )
+    return fb
+
+
 class KimiK3DeltaAttention(nn.Module):
     """KDA attention; optional full-rank gate."""
 
@@ -1594,10 +1771,15 @@ class KimiK3DeltaAttention(nn.Module):
         prefix: str = "",
         all_reduce_fusion: bool = False,
         bfa_alt_stream: Optional[torch.cuda.Stream] = None,
+        kda_shard_group=None,
         **kwargs,
     ) -> None:
         super().__init__()
         self.all_reduce_fusion = all_reduce_fusion
+        # Shared-experts comm domain for the KDA shard mode (pure DP attention
+        # + explicit shared-experts TP width): weights are head-sharded over
+        # this group and the forward gathers / reduce-scatters rows on it.
+        self._kda_shard_group = kda_shard_group
         # Side stream for the [f_a|b] + f_b tiny GEMVs: they read only
         # hidden_states, so they can run concurrently with the wide fused
         # [q,k,v,g] GEMM on the main stream (graphed decode/verify only).
@@ -1798,7 +1980,23 @@ class KimiK3DeltaAttention(nn.Module):
         self.dt_bias = nn.Parameter(
             torch.empty(divide(projection_size, self.attn_tp_size), dtype=torch.float32)
         )
-        set_weight_attrs(self.dt_bias, {"weight_loader": sharded_weight_loader(0)})
+
+        # dt_bias shards per head, but weight loading happens AFTER
+        # _kda_shared_experts_attn_tp exits (the live attn_tp_rank reverts to
+        # the real one, 0 under pure DP) — capture the construction-time rank.
+        _dt_tp_rank = self.attn_tp_rank
+        _dt_tp_size = self.attn_tp_size
+
+        def _dt_bias_weight_loader(
+            param: torch.Tensor, loaded_weight: torch.Tensor
+        ) -> None:
+            shard_size = param.data.shape[0]
+            start_idx = _dt_tp_rank * shard_size
+            loaded_weight = loaded_weight.narrow(0, start_idx, shard_size)
+            assert loaded_weight.shape == param.data.shape
+            param.data.copy_(loaded_weight)
+
+        set_weight_attrs(self.dt_bias, {"weight_loader": _dt_bias_weight_loader})
 
         self.qkv_conv1d = MergedColumnParallelLinear(
             input_size=self.conv_size,
@@ -1821,12 +2019,16 @@ class KimiK3DeltaAttention(nn.Module):
             torch.empty(1, 1, self.local_num_heads, 1, dtype=torch.float32)
         )
 
+        # A_log shards per head too; same construction-time rank capture as
+        # dt_bias above (weight loading runs after _kda_shared_experts_attn_tp
+        # exits and the live attn_tp_rank reverts to the real one).
+        _a_tp_rank = self.attn_tp_rank
+
         def _a_log_weight_loader(
             param: torch.Tensor, loaded_weight: torch.Tensor
         ) -> None:
-            tp_rank = get_parallel().attn_tp_rank
             shard_size = param.data.shape[2]  # local_num_heads
-            start_idx = tp_rank * shard_size
+            start_idx = _a_tp_rank * shard_size
 
             # Handle old 4-D checkpoint format: [1, 1, H, 1] -> [H]
             if loaded_weight.dim() == 4:
@@ -1842,6 +2044,10 @@ class KimiK3DeltaAttention(nn.Module):
         self.o_norm = FusedRMSNormGated(
             self.head_dim, eps=rms_norm_eps, activation="sigmoid"
         )
+        # KDA shard mode: o_proj emits shard-group-partial sums over the
+        # gathered rows; the forward's reduce-scatter completes the reduction
+        # and splits back to local rows, so no in-GEMM reduce here.
+        _kda_shard = kda_shard_group is not None
         self.o_proj = RowParallelLinear(
             projection_size,
             self.hidden_size,
@@ -1851,7 +2057,7 @@ class KimiK3DeltaAttention(nn.Module):
             # all-reduce (which can fold the attn-res prefix add in). Only
             # valid when the attn TP group is the full TP group (the fused
             # comm lives there).
-            reduce_results=not self.all_reduce_fusion,
+            reduce_results=not self.all_reduce_fusion and not _kda_shard,
             quant_config=quant_config,
             tp_rank=self.attn_tp_rank,
             tp_size=self.attn_tp_size,
@@ -1865,7 +2071,7 @@ class KimiK3DeltaAttention(nn.Module):
             # use_symmetric_memory(attn_tp), which allocates its own output and
             # so defeats the caller-owned buffer. At the fusion config
             # attn_tp==tp so the fused full-TP reduce is the same group anyway.
-            use_dp_attention_reduce=not self.all_reduce_fusion,
+            use_dp_attention_reduce=not self.all_reduce_fusion and not _kda_shard,
             prefix=f"{prefix}.o_proj",
         )
         if self.all_reduce_fusion and not _o_proj_takes_output(self.o_proj):
@@ -2047,6 +2253,17 @@ class KimiK3DeltaAttention(nn.Module):
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
     ) -> torch.Tensor:
+        # KDA shard mode: all-gather the (MAX_LEN-padded) local rows on the
+        # shared-experts group, run the core on the gathered batch with a
+        # structural metadata view, and reduce-scatter the o_proj partial
+        # back to local rows. Mirrors the shared-experts AG/RS flow.
+        shard_group = self._kda_shard_group
+        if shard_group is not None:
+            local_hidden = hidden_states
+            hidden_states = _kda_gather_rows(hidden_states, shard_group)
+            forward_batch = _kda_gathered_forward_batch(
+                forward_batch, shard_group, local_hidden.shape[0]
+            )
         if self.do_fuse_qkvbfg or self.use_full_rank_gate:
             mixed_qkv, beta, forget_gate, g_proj_states = self.forward_qkvbfg_fused(
                 hidden_states
@@ -2105,7 +2322,12 @@ class KimiK3DeltaAttention(nn.Module):
             out = _k3_symm_o_proj_out(self.o_proj, core_attn_out)
             partial, _ = self.o_proj(core_attn_out, output_tensor=out)
             return partial
-        return self.o_proj(core_attn_out)[0]
+        out = self.o_proj(core_attn_out)[0]
+        if shard_group is not None:
+            # o_proj is reduce-deferred in shard mode: complete the shard-
+            # group sum and split back to this rank's local rows.
+            out = _kda_reduce_scatter_rows(out, local_hidden, shard_group)
+        return out
 
 
 class KimiK3MLAAttention(DeepseekV2AttentionMLA):
@@ -2429,18 +2651,28 @@ class KimiK3DecoderLayer(nn.Module):
         )
 
         # Attention
+        # KDA shard mode (pure DP attention + explicit shared-experts TP
+        # width): construct the KDA attention inside the shared-experts
+        # attn-tp override so its head-sharded weights shard over the
+        # shared-experts group; the forward communicates on that group.
+        _kda_shard_group = None
         if config.is_kda_layer(layer_idx):
-            self.self_attn = KimiK3DeltaAttention(
-                layer_idx=layer_idx,
-                hidden_size=config.hidden_size,
-                config=config,
-                quant_config=quant_config,
-                prefix=f"{prefix}.self_attn",
-                all_reduce_fusion=self.all_reduce_fusion,
-                # Shared with the MLA gate stream: KDA and MLA layers never
-                # run concurrently within one forward, so the stream is free.
-                bfa_alt_stream=(alt_streams[2] if alt_streams is not None else None),
-            )
+            with _kda_shared_experts_attn_tp() as _kda_shard_group:
+                self.self_attn = KimiK3DeltaAttention(
+                    layer_idx=layer_idx,
+                    hidden_size=config.hidden_size,
+                    config=config,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.self_attn",
+                    all_reduce_fusion=self.all_reduce_fusion,
+                    # Shared with the MLA gate stream: KDA and MLA layers
+                    # never run concurrently within one forward, so the
+                    # stream is free.
+                    bfa_alt_stream=(
+                        alt_streams[2] if alt_streams is not None else None
+                    ),
+                    kda_shard_group=_kda_shard_group,
+                )
         else:
             self.self_attn = KimiK3MLAAttention(
                 config=config,
@@ -2451,6 +2683,7 @@ class KimiK3DecoderLayer(nn.Module):
                 alt_stream=alt_streams[1] if alt_streams is not None else None,
                 gate_alt_stream=alt_streams[2] if alt_streams is not None else None,
             )
+        self._kda_shard = _kda_shard_group is not None
 
         # the attention drops the fusion when its o_proj cannot write into
         # caller-owned storage; the layer's own AR call-site must agree
@@ -2576,7 +2809,10 @@ class KimiK3DecoderLayer(nn.Module):
         # DP attention: idle ranks (padded to the global shape) have no
         # attention metadata; pass hidden_states through shape-preserving
         # (same as the LayerCommunicator models' is_idle skip).
-        if forward_batch.forward_mode.is_idle():
+        # KDA shard mode: idle ranks still join the shard group's
+        # all-gather / reduce-scatter (rows are MAX_LEN-padded to equal
+        # counts), so the early-out must not fire.
+        if forward_batch.forward_mode.is_idle() and not self._kda_shard:
             return hidden_states, None
 
         # mlp-sync (DP attention OR MoE a2a/EP — require_mlp_sync) pads
@@ -2590,7 +2826,14 @@ class KimiK3DecoderLayer(nn.Module):
         # output back; padded rows are discarded downstream.
         num_padded = hidden_states.shape[0]
         num_real = num_padded
-        if self._trim_padded_attn and forward_batch.forward_mode.is_extend():
+        # KDA shard mode: every rank's rows (pads included) must reach the
+        # shard-group all-gather with equal counts — trimming would skew the
+        # gathered layout and break the AG/RS symmetry.
+        if (
+            self._trim_padded_attn
+            and not self._kda_shard
+            and forward_batch.forward_mode.is_extend()
+        ):
             extend_lens = forward_batch.extend_seq_lens_cpu
             if extend_lens is not None:
                 num_real = min(int(sum(extend_lens)), num_padded)
