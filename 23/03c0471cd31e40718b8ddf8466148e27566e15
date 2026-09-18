@@ -1,0 +1,74 @@
+python/sglang/srt/hardware_backend/npu/attention/ascend_kda_backend.py
+  s_615e282f1185f5::t_adbc3c57904ef8 1336-1350
+  s_615e282f1185f5::t_033b4602ecc41d 1364-1365,1367-1368
+python/sglang/srt/models/kimi_k3.py
+  s_615e282f1185f5::t_c4df52561abd20 123-126
+  s_615e282f1185f5::t_3a72978a383088 1717-1724
+  s_615e282f1185f5::t_fc78a2709867b4 2295,2299,2301-2313
+  s_615e282f1185f5::t_7d120acedb5cc6 1736-1758
+python/sglang/srt/mem_cache/allocator/mamba.py
+  s_615e282f1185f5::t_d4b84cc8f05fd1 103-105,107-110
+  s_615e282f1185f5::t_5d75102ed7d9d4 38-45,47
+python/sglang/srt/layers/attention/mamba/mamba2_metadata.py
+  s_615e282f1185f5::t_1a736dc2bec109 78-87
+python/sglang/srt/mem_cache/memory_pool.py
+  s_615e282f1185f5::t_1213bbcb56d2ff 1227
+  s_615e282f1185f5::t_c68fed8871839a 1228
+  s_615e282f1185f5::t_fd6d7cb8e61398 1257,1275
+  s_615e282f1185f5::t_8ebc1e0cc1d9c8 1291-1295,1301
+  s_615e282f1185f5::t_a4bb795fd443d3 1256,1274
+  s_615e282f1185f5::t_22b926ad95f85a 1296-1297,1299
+python/sglang/srt/mem_cache/kv_cache_configurator.py
+  s_615e282f1185f5::t_75e3d18e1a48b9 935-943
+  s_615e282f1185f5::t_887d1775df45da 912-934,944-955,958-961
+  s_615e282f1185f5::t_3af9ab9c8f69bc 97-107
+  s_615e282f1185f5::t_727decd56ee090 2161-2165,2167-2169
+python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py
+  s_615e282f1185f5::t_fdb7b050bb9e1b 309
+  s_615e282f1185f5::t_e873a90ae4b4a2 59-65
+  s_615e282f1185f5::t_c380210560e61f 144-146,149
+  s_615e282f1185f5::t_f9232700b07a6b 191-198
+  s_615e282f1185f5::t_288b0836cbd801 1373-1374,1383-1384
+  s_615e282f1185f5::t_409426285f11d2 308
+  s_615e282f1185f5::t_6c5e84d5d57d7f 1236-1244,1250-1252
+  s_615e282f1185f5::t_591170a7196988 1305-1310,1313-1323,1326-1327
+  s_615e282f1185f5::t_bf50054b1abec3 133-143,147-148,150-156
+  s_615e282f1185f5::t_cf08b1682ed0b9 1302-1304,1311-1312,1324-1325
+python/sglang/srt/layers/attention/linear/kda_backend.py
+  s_615e282f1185f5::t_78758819d952d2 448-453,457-488,497-504,506
+  s_615e282f1185f5::t_cc481842ed35be 42,45-56
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "2303c0471cd31e40718b8ddf8466148e27566e15",
+  "prompts": {},
+  "humans": {
+    "h_30a34a661c3284": {
+      "author": "liupeng <782420244@qq.com>"
+    }
+  },
+  "sessions": {
+    "s_615e282f1185f5": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6aaba3879f1ffdd0413a1515",
+        "model": "glm-5.3__dev"
+      },
+      "human_author": "liupeng <782420244@qq.com>",
+      "custom_attributes": {
+        "client_type": "ide",
+        "tool_use_id": "6aacfa2f9f1ffdd0413a20fd",
+        "source_scene": "unknown",
+        "dedupe_key": "6aaba3879f1ffdd0413a1515:6aacfa2f9f1ffdd0413a20fd:afterEdit:0e5af31c",
+        "runtime_client": "trae-tob-git-ai",
+        "operation_id": "6aacfa2f9f1ffdd0413a20fd",
+        "tool_id": "Edit",
+        "edit_kind": "file_edit",
+        "external_session_id": "6aaba3879f1ffdd0413a1515",
+        "tool_type": "agent",
+        "session_id": "6aaba3879f1ffdd0413a1515"
+      }
+    }
+  }
+}
