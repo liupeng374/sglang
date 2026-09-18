@@ -363,6 +363,9 @@ class AscendAttnBackend(AttentionBackend):
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.graph_mode = False
+        # Persistent K/V workspace shared by all layers for the MLA
+        # prefix-cache extend path (see _get_mla_prefix_workspace).
+        self._mla_prefix_ws = None
         self.use_fa = get_bool_env_var("ASCEND_USE_FA", "False")
         self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
         self.use_fias_v2_bsnd = (
@@ -2283,6 +2286,49 @@ class AscendAttnBackend(AttentionBackend):
 
         return attn_out
 
+    # Number of prefix tokens processed per gather + kv_b_proj step in the MLA
+    # prefix-cache extend path. Fixed-size slices keep every transient
+    # allocation constant so the NPU caching allocator can reuse the same
+    # blocks across chunks instead of growing the memory pool.
+    _MLA_PREFIX_SLICE_TOKENS = 8192
+
+    def _get_mla_prefix_workspace(
+        self, dtype, num_kv_heads, qk_dim, v_dim, min_tokens
+    ):
+        """Return the persistent K/V workspace for the MLA prefix-cache path.
+
+        Allocated once for max_context_len tokens and shared by all layers:
+        prefix K/V are materialized into this buffer slice by slice and the
+        current chunk is appended in place, so no per-chunk allocation grows
+        with the prefix length (which previously inflated the NPU allocator
+        pool by 8-10GB at 140k contexts).
+        """
+        ws = self._mla_prefix_ws
+        if (
+            ws is not None
+            and ws["k"].dtype == dtype
+            and ws["k"].shape[1] == num_kv_heads
+            and ws["k"].shape[2] == qk_dim
+            and ws["v"].shape[2] == v_dim
+            and ws["k"].shape[0] >= min_tokens
+        ):
+            return ws
+        total_tokens = max(self.max_context_len + self.page_size, min_tokens)
+        ws = {
+            "k": torch.empty(
+                (total_tokens, num_kv_heads, qk_dim),
+                dtype=dtype,
+                device=self.device,
+            ),
+            "v": torch.empty(
+                (total_tokens, num_kv_heads, v_dim),
+                dtype=dtype,
+                device=self.device,
+            ),
+        }
+        self._mla_prefix_ws = ws
+        return ws
+
     def forward_extend(
         self,
         q,
@@ -2746,70 +2792,122 @@ class AscendAttnBackend(AttentionBackend):
             # This branch adds support for prefix cache for GLM-4.7-Flash.
             # When using the MLA architecture, if qk head dim equals v head dim and the head count is not a power of 2,
             # we use the FIA kernel for computation.
+            #
+            # Memory: all layers share a persistent workspace allocated once
+            # for max_context_len tokens. The prefix latent is gathered and
+            # up-projected (kv_b_proj) into the workspace in fixed-size slices,
+            # and the current chunk is appended in place, so no transient
+            # allocation grows with the prefix length (which previously made
+            # the NPU allocator pool grow monotonically to 8-10GB at 140k).
             q = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
 
             k_buffer = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
             v_buffer = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
-            kv_cached = gather_mla_cache_pages(
-                k_buffer,
-                self.forward_metadata.flatten_prefix_block_tables,
-                is_nz=is_fia_nz(),
-            )
-            k_rope_cached = gather_mla_cache_pages(
-                v_buffer,
-                self.forward_metadata.flatten_prefix_block_tables,
-                is_nz=is_fia_nz(),
-            ).flatten(0, 1)
 
             assert layer.kv_b_proj is not None
-            kv = layer.kv_b_proj(kv_cached)[0].view(
-                -1, layer.tp_k_head_num, self.qk_nope_head_dim + layer.v_head_dim
-            )
-            k_nope, v_pre = kv.split([self.qk_nope_head_dim, layer.v_head_dim], dim=-1)
+            num_kv_heads = layer.tp_k_head_num
+            nope_dim = self.qk_nope_head_dim
+            rope_dim = self.qk_rope_head_dim
+            v_dim = layer.v_head_dim
+            qk_dim = nope_dim + rope_dim
+            page = self.page_size
+            use_nz = is_fia_nz()
 
-            k_rope = k_rope_cached.expand(-1, layer.tp_k_head_num, -1)
-            k_pre = torch.cat([k_nope, k_rope], dim=-1)
+            flat_prefix_block_tables = (
+                self.forward_metadata.flatten_prefix_block_tables
+            )
+            prefix_lens = self.forward_metadata.prefix_lens
+            max_req_tokens = max(
+                int(p) + int(e)
+                for p, e in zip(
+                    prefix_lens, self.forward_metadata.extend_seq_lens_cpu_int
+                )
+            )
+            ws = self._get_mla_prefix_workspace(
+                q.dtype, num_kv_heads, qk_dim, v_dim, max_req_tokens
+            )
+            ws_k = ws["k"]
+            ws_v = ws["v"]
+            # Each request restarts at workspace offset 0; requests are handled
+            # sequentially on the compute stream, so in-place reuse is safe.
+            slice_pages = max(1, self._MLA_PREFIX_SLICE_TOKENS // page)
 
             attn_output = torch.empty(
-                (q.size(0), layer.tp_q_head_num, layer.v_head_dim),
+                (q.size(0), layer.tp_q_head_num, v_dim),
                 device=q.device,
                 dtype=q.dtype,
             )
             q_len_offset = 0
-            prefix_len_offset = 0
+            page_offset = 0
             for q_len, prefix_len in zip(
                 self.forward_metadata.extend_seq_lens_cpu_int,
-                self.forward_metadata.prefix_lens,
+                prefix_lens,
             ):
-                k_cur_slice = k[None, q_len_offset : q_len_offset + q_len]
-                v_cur_slice = v[None, q_len_offset : q_len_offset + q_len]
-                k_pre_slice = k_pre[
-                    None, prefix_len_offset : prefix_len_offset + prefix_len
-                ]
-                v_pre_slice = v_pre[
-                    None, prefix_len_offset : prefix_len_offset + prefix_len
-                ]
+                q_len = int(q_len)
+                prefix_len = int(prefix_len)
+                num_pages = (prefix_len + page - 1) // page
+                if q_len > 0:
+                    # Project the cached latent prefix into the workspace,
+                    # slice by slice (bounded transient allocations).
+                    for slice_start in range(0, num_pages, slice_pages):
+                        page_ids = flat_prefix_block_tables[
+                            page_offset
+                            + slice_start : page_offset
+                            + min(slice_start + slice_pages, num_pages)
+                        ]
+                        num_tokens = page_ids.numel() * page
+                        token_start = slice_start * page
+                        kv_cached = gather_mla_cache_pages(
+                            k_buffer, page_ids, is_nz=use_nz
+                        )
+                        k_rope_cached = (
+                            gather_mla_cache_pages(
+                                v_buffer, page_ids, is_nz=use_nz
+                            )
+                            .flatten(0, 1)
+                            .unsqueeze(1)
+                            .expand(-1, num_kv_heads, -1)
+                        )
+                        kv = layer.kv_b_proj(kv_cached)[0].view(
+                            -1, num_kv_heads, nope_dim + v_dim
+                        )
+                        # In-place k_pre: write nope + broadcast rope directly
+                        # into the K workspace instead of torch.cat.
+                        ws_k[
+                            token_start : token_start + num_tokens, :, :nope_dim
+                        ].copy_(kv[..., :nope_dim])
+                        ws_k[
+                            token_start : token_start + num_tokens, :, nope_dim:
+                        ].copy_(k_rope_cached)
+                        ws_v[token_start : token_start + num_tokens].copy_(
+                            kv[..., nope_dim:]
+                        )
 
-                k_full = torch.cat([k_pre_slice, k_cur_slice], dim=1)
-                v_full = torch.cat([v_pre_slice, v_cur_slice], dim=1)
-
-                attn_output[q_len_offset : q_len_offset + q_len] = (
-                    torch.ops.npu.npu_fused_infer_attention_score(
-                        q[None, q_len_offset : q_len_offset + q_len],
-                        k_full,
-                        v_full,
-                        num_heads=layer.tp_q_head_num,
-                        num_key_value_heads=layer.tp_k_head_num,
-                        input_layout="BSND",  # todo, TND not supports q_heads!=k_heads
-                        atten_mask=self.fia_mask,
-                        sparse_mode=3,
-                        scale=layer.scaling,
-                        next_tokens=0,
-                    )[0]
-                )
+                    # Append the current chunk in place; FIA then reads the
+                    # contiguous [prefix | chunk] span from the workspace.
+                    ws_k[prefix_len : prefix_len + q_len].copy_(
+                        k[q_len_offset : q_len_offset + q_len]
+                    )
+                    ws_v[prefix_len : prefix_len + q_len].copy_(
+                        v[q_len_offset : q_len_offset + q_len]
+                    )
+                    attn_output[q_len_offset : q_len_offset + q_len] = (
+                        torch.ops.npu.npu_fused_infer_attention_score(
+                            q[None, q_len_offset : q_len_offset + q_len],
+                            ws_k[None, : prefix_len + q_len],
+                            ws_v[None, : prefix_len + q_len],
+                            num_heads=layer.tp_q_head_num,
+                            num_key_value_heads=num_kv_heads,
+                            input_layout="BSND",  # todo, TND not supports q_heads!=k_heads
+                            atten_mask=self.fia_mask,
+                            sparse_mode=3,
+                            scale=layer.scaling,
+                            next_tokens=0,
+                        )[0]
+                    )
                 q_len_offset += q_len
-                prefix_len_offset += prefix_len
-            attn_output = attn_output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+                page_offset += num_pages
+            attn_output = attn_output.view(-1, layer.tp_q_head_num * v_dim)
         else:
             if layer.qk_head_dim == layer.v_head_dim:
                 """FIA will support multi-bs in the later version of CANN"""
