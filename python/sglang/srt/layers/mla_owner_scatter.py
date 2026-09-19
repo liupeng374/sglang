@@ -20,6 +20,29 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
+# ---------------------------------------------------------------------------
+# Token-shard mode flag
+#
+# When the SP-MoE pipeline keeps its output sharded (sp_attn_res = True:
+# k3_sp_collective + SGLANG_K3_SP_ATTN_RES), MLA consumes the 1/attn_tp token
+# shard directly — no all-gather before attention, no reduce-scatter after.
+# The model sets this once from its sp_attn_res computation; the backend's
+# graph-metadata planner reads it to pick the shard-sized sub_fb (vs the
+# full-bucket owner-scatter sub_fb used when sp_attn_res is False).
+# ---------------------------------------------------------------------------
+_TOKEN_SHARD_ACTIVE: bool = False
+
+
+def set_mla_token_shard_active(value: bool) -> None:
+    global _TOKEN_SHARD_ACTIVE
+    _TOKEN_SHARD_ACTIVE = value
+
+
+def mla_token_shard_active() -> bool:
+    """Whether MLA consumes the SP-MoE token shard directly (no all-gather)."""
+    return _TOKEN_SHARD_ACTIVE
+
+
 def _owner_of(req_pool_indices: torch.Tensor, tp: int) -> torch.Tensor:
     return req_pool_indices.to(torch.long) % tp
 
@@ -233,7 +256,23 @@ def mla_graph_owned_view(forward_batch: ForwardBatch, out_cache_loc_buf: torch.T
     # the backend's persistent buffer in place (owned rows front-packed,
     # tail -> reserved slot 0).
     if forward_batch.out_cache_loc is not None:
-        out_cache_loc_buf[:n_rows].copy_(forward_batch.out_cache_loc[owned_rows])
+        loc = forward_batch.out_cache_loc
+        n_loc = loc.shape[0]
+        if n_loc == 0:
+            # IDLE / empty replay batch (e.g. an idle DP rank with 0 tokens):
+            # no live KV write targets; slot 0 (inert) for all owned rows so
+            # front-packing the owned subset stays in-bounds against the graph
+            # bucket.
+            out_cache_loc_buf[:n_rows].zero_()
+        else:
+            safe_rows = owned_rows.clamp(max=n_loc - 1)
+            picked = loc[safe_rows].to(out_cache_loc_buf.dtype)
+            out_of_range = owned_rows >= n_loc
+            if bool(out_of_range.any()):
+                picked = torch.where(
+                    out_of_range, torch.zeros_like(picked), picked
+                )
+            out_cache_loc_buf[:n_rows].copy_(picked)
         out_cache_loc_buf[n_rows:].zero_()
         sub.out_cache_loc = out_cache_loc_buf[:row_bucket]
     return sub, owned_rows, n_rows
@@ -253,3 +292,184 @@ def mla_scatter_row_partition(
     out = sub_out.new_zeros(full_shape)
     out.index_add_(0, rows, sub_out)
     return group.all_reduce(out)
+
+
+# ---------------------------------------------------------------------------
+# Token-shard views (SP-MoE token shard, 1/attn_tp contiguous rows)
+#
+# When MLA receives the SP-MoE reduce-scatter output directly (no all-gather),
+# the hidden_states is already 1/attn_tp of the full batch — a contiguous token
+# range.  These helpers build the matching sub-forward-batch so the attention
+# backend plans metadata for the shard's requests only.
+# ---------------------------------------------------------------------------
+
+def _shard_req_rows(forward_batch: ForwardBatch):
+    """Contiguous (req_indices, row_indices) for this rank's token shard."""
+    parallel = get_parallel()
+    rank = parallel.attn_tp_rank
+    tp = parallel.attn_tp_size
+    mode = forward_batch.forward_mode
+    device = forward_batch.req_pool_indices.device
+
+    if mode.is_decode_or_idle():
+        total = forward_batch.batch_size
+        shard = total // tp
+        lo = rank * shard
+        req_indices = torch.arange(
+            lo, lo + shard, device=device, dtype=torch.long
+        )
+        rows = req_indices  # decode: 1 row per request
+    elif mode.is_target_verify():
+        total_rows = (
+            forward_batch.input_ids.shape[0]
+            if forward_batch.input_ids is not None
+            else 0
+        )
+        shard_rows = total_rows // tp
+        lo = rank * shard_rows
+        rows = torch.arange(
+            lo, lo + shard_rows, device=device, dtype=torch.long
+        )
+        dt = forward_batch.spec_info.draft_token_num
+        req_indices = torch.arange(
+            lo // dt, lo // dt + shard_rows // dt,
+            device=device, dtype=torch.long,
+        )
+    else:
+        raise RuntimeError(
+            "token-shard view supports decode/target_verify only"
+        )
+    return req_indices, rows
+
+
+def mla_shard_view(forward_batch: ForwardBatch):
+    """Eager per-step token-shard view: (req_indices, row_indices,
+    sub_forward_batch) for the contiguous 1/attn_tp token range produced by
+    the SP-MoE reduce-scatter.
+
+    Unlike mla_owned_view (which selects by req_pool_idx % attn_tp), this
+    selects the contiguous range [rank*shard, (rank+1)*shard). Used when MLA
+    receives the SP-MoE token shard directly (no all-gather): each rank
+    computes full-head MLA attention for its 1/attn_tp token subset, and the
+    output is already correct (MLA replication → no reduce needed).
+    """
+    total_rows = (
+        forward_batch.input_ids.shape[0]
+        if forward_batch.input_ids is not None
+        else -1
+    )
+    cached = getattr(forward_batch, "_mla_shard_view", None)
+    if (
+        cached is not None
+        and cached[0] is forward_batch.req_pool_indices
+        and cached[1] == total_rows
+    ):
+        return cached[2], cached[3], cached[4]
+
+    req_indices, rows = _shard_req_rows(forward_batch)
+    sub = _subset_fb(forward_batch, req_indices, rows)
+
+    forward_batch._mla_shard_view = (
+        forward_batch.req_pool_indices,
+        total_rows,
+        req_indices,
+        rows,
+        sub,
+    )
+    return req_indices, rows, sub
+
+
+def mla_graph_shard_view(
+    forward_batch: ForwardBatch, out_cache_loc_buf: torch.Tensor
+):
+    """Graph capture/replay token-shard view: a compact SHARD-SIZED sub
+    forward batch matching the 1/attn_tp contiguous token range produced by
+    the SP-MoE reduce-scatter.
+
+    Unlike mla_graph_owned_view (which front-packs owned rows into the full
+    graph bucket with zero padding), this prepares a sub_fb whose batch_size
+    and row count are exactly the shard size, because under sp_attn_res the
+    graph captures MLA attention kernels at shard size (the SP-MoE
+    reduce-scatter output shape).
+
+    out_cache_loc_buf is the backend's persistent KV-write-target buffer
+    (allocated at full-bucket size); only the first n_rows elements are
+    used as a view.
+
+    Returns (sub_fb, shard_row_indices, n_rows).
+    """
+    assert (
+        forward_batch.forward_mode.is_decode_or_idle()
+        or forward_batch.forward_mode.is_target_verify()
+    ), "graph token-shard view supports decode/target_verify only"
+    parallel = get_parallel()
+    rank = parallel.attn_tp_rank
+    tp = parallel.attn_tp_size
+    req_bucket = forward_batch.batch_size
+    row_bucket = (
+        forward_batch.input_ids.shape[0]
+        if forward_batch.input_ids is not None
+        else req_bucket
+    )
+    device = forward_batch.req_pool_indices.device
+    mode = forward_batch.forward_mode
+
+    if mode.is_decode_or_idle():
+        shard_req = req_bucket // tp
+        shard_row = row_bucket // tp
+    else:  # target_verify
+        shard_row = row_bucket // tp
+        dt = forward_batch.spec_info.draft_token_num
+        shard_req = shard_row // dt
+
+    lo_req = rank * shard_req
+    lo_row = rank * shard_row
+    n_req = shard_req
+    n_rows = shard_row
+    shard_rows = torch.arange(
+        lo_row, lo_row + n_rows, device=device, dtype=torch.long
+    )
+
+    sub = copy.copy(forward_batch)
+    sub.batch_size = n_req
+    sub._original_batch_size = n_req
+    sub.req_pool_indices = forward_batch.req_pool_indices[
+        lo_req : lo_req + n_req
+    ].contiguous()
+    if forward_batch.seq_lens is not None:
+        sub.seq_lens = forward_batch.seq_lens[
+            lo_req : lo_req + n_req
+        ].contiguous()
+    if forward_batch.seq_lens_cpu is not None:
+        if torch.is_tensor(forward_batch.seq_lens_cpu):
+            sub.seq_lens_cpu = forward_batch.seq_lens_cpu[
+                lo_req : lo_req + n_req
+            ].contiguous()
+        else:
+            sub.seq_lens_cpu = list(
+                forward_batch.seq_lens_cpu[lo_req : lo_req + n_req]
+            )
+    if forward_batch.positions is not None:
+        sub.positions = forward_batch.positions[
+            lo_row : lo_row + n_rows
+        ].contiguous()
+    if forward_batch.input_ids is not None:
+        sub.input_ids = forward_batch.input_ids[
+            lo_row : lo_row + n_rows
+        ].contiguous()
+    if forward_batch.out_cache_loc is not None:
+        loc = forward_batch.out_cache_loc
+        n_loc = loc.shape[0]
+        if n_loc == 0:
+            out_cache_loc_buf[:n_rows].zero_()
+        else:
+            safe_end = min(lo_row + n_rows, n_loc)
+            actual_n = max(0, safe_end - lo_row)
+            if actual_n > 0:
+                out_cache_loc_buf[:actual_n].copy_(
+                    loc[lo_row:safe_end].to(out_cache_loc_buf.dtype)
+                )
+            if actual_n < n_rows:
+                out_cache_loc_buf[actual_n:n_rows].zero_()
+        sub.out_cache_loc = out_cache_loc_buf[:n_rows]
+    return sub, shard_rows, n_rows

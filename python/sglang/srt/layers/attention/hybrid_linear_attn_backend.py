@@ -32,7 +32,9 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.dp_attention import mla_owner_scatter_enabled
 from sglang.srt.layers.mla_owner_scatter import (
     mla_graph_owned_view,
+    mla_graph_shard_view,
     mla_scatter_applies,
+    mla_token_shard_active,
 )
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -1047,25 +1049,44 @@ class HybridLinearAttnBackend(AttentionBackend):
             and mla_scatter_applies(forward_batch)
             and not forward_batch.forward_mode.is_draft_extend_v2()
         ):
-            # Owner-scatter MLA (dp_attention.mla_owner_scatter_enabled):
-            # the full-attention (MLA) child plans the owned subset
-            # front-packed to the graph bucket and its static perm / n /
-            # out_cache_loc buffers are refreshed in place — the captured
-            # model graph reads them to select this rank's rows. The
-            # linear/KDA child keeps the full local batch: its attention is
-            # head-sharded across the group and needs every request.
-            sub_fb, owned_rows, n_rows = mla_graph_owned_view(
-                forward_batch,
-                self._mla_scatter_out_cache_loc_buf(),
-            )
             full = self.full_attn_backend
-            full.mla_scatter_perm[:n_rows].copy_(
-                owned_rows.to(torch.long)
-            )
-            full.mla_scatter_perm[n_rows:].zero_()
-            full.mla_scatter_n.fill_(n_rows)
-            full.mla_scatter_sub_fb = sub_fb
-            full.init_forward_metadata_out_graph(sub_fb, in_capture=in_capture)
+            if mla_token_shard_active():
+                # Token-shard MLA (sp_attn_res): the graph captures MLA
+                # attention at shard size (SP-MoE reduce-scatter output).
+                # Prepare a compact shard-sized sub_fb; no perm buffer
+                # needed (the shard is contiguous, no front-packing into a
+                # full bucket).  The model-side graph path runs attention
+                # directly on the shard with this sub_fb.
+                sub_fb, shard_rows, n_rows = mla_graph_shard_view(
+                    forward_batch,
+                    self._mla_scatter_out_cache_loc_buf(),
+                )
+                full.mla_scatter_n.fill_(n_rows)
+                full.mla_scatter_sub_fb = sub_fb
+                full.init_forward_metadata_out_graph(
+                    sub_fb, in_capture=in_capture
+                )
+            else:
+                # Owner-scatter MLA: the full-attention (MLA) child plans
+                # the owned subset front-packed to the graph bucket and its
+                # static perm / n / out_cache_loc buffers are refreshed in
+                # place — the captured model graph reads them to select
+                # this rank's rows.  The linear/KDA child keeps the full
+                # local batch: its attention is head-sharded across the
+                # group and needs every request.
+                sub_fb, owned_rows, n_rows = mla_graph_owned_view(
+                    forward_batch,
+                    self._mla_scatter_out_cache_loc_buf(),
+                )
+                full.mla_scatter_perm[:n_rows].copy_(
+                    owned_rows.to(torch.long)
+                )
+                full.mla_scatter_perm[n_rows:].zero_()
+                full.mla_scatter_n.fill_(n_rows)
+                full.mla_scatter_sub_fb = sub_fb
+                full.init_forward_metadata_out_graph(
+                    sub_fb, in_capture=in_capture
+                )
             self.linear_attn_backend.init_forward_metadata_out_graph(
                 forward_batch, in_capture=in_capture
             )

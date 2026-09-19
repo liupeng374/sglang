@@ -123,9 +123,13 @@ from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
 from sglang.srt.layers.dp_attention import mla_owner_scatter_enabled
 from sglang.srt.layers.mla_owner_scatter import (
     mla_graph_owned_view,
+    mla_graph_shard_view,
     mla_owned_view,
     mla_scatter_applies,
     mla_scatter_row_partition,
+    mla_shard_view,
+    mla_token_shard_active,
+    set_mla_token_shard_active,
 )
 from sglang.srt.multimodal.encoder_preprocessing import EncoderMediaProcessorConfig
 from sglang.srt.multimodal.kimi_k3_image_processing import (
@@ -2695,7 +2699,7 @@ class KimiK3DecoderLayer(nn.Module):
             and isinstance(self.self_attn, DeepseekV2AttentionMLA)
             and not getattr(self.self_attn, "is_nextn", False)
             and not forward_batch.forward_mode.is_draft_extend_v2()
-            and _mla_scatter_applies(forward_batch)
+            and mla_scatter_applies(forward_batch)
         ):
             return self._run_self_attn_owner_scattered(
                 hidden_states,
@@ -2733,6 +2737,11 @@ class KimiK3DecoderLayer(nn.Module):
           path), the module runs on the permuted bucket rows with the
           static owned metadata, and the output is un-permuted with a
           row-masked index_add before the all-reduce.
+
+        Token-shard mode (sp_attn_res): when the SP-MoE pipeline keeps its
+        output sharded, hidden_states is already 1/attn_tp — no owner
+        selection, no all-reduce.  Each rank computes full-head MLA for its
+        contiguous shard and returns the sharded output directly.
         """
         in_whole_graph = (
             get_is_capture_mode()
@@ -2748,6 +2757,32 @@ class KimiK3DecoderLayer(nn.Module):
                 prev_topk_indices=prev_topk_indices,
             )
 
+        # Token-shard: hidden_states is already the 1/attn_tp shard from
+        # SP-MoE reduce-scatter.  Each rank computes full-head MLA for its
+        # contiguous shard; output stays sharded (MLA replication → no
+        # reduce needed).
+        full_rows = (
+            forward_batch.input_ids.shape[0]
+            if forward_batch.input_ids is not None
+            else forward_batch.batch_size
+        )
+        if mla_token_shard_active() and hidden_states.shape[0] < full_rows:
+            req_indices, rows, sub_fb = mla_shard_view(forward_batch)
+            _mla_scatter_init_metadata(forward_batch, sub_fb)
+            sub_out, sub_topk = self._run_self_attn_full_batch(
+                hidden_states,
+                positions[rows],
+                sub_fb,
+                zero_allocator,
+                prev_topk_indices=(
+                    prev_topk_indices[rows]
+                    if prev_topk_indices is not None
+                    else None
+                ),
+            )
+            return sub_out, sub_topk
+
+        # Owner-scatter (full-batch input): select owned rows, all-reduce.
         owned_req, rows, sub_fb = mla_owned_view(forward_batch)
         n_owned = int(owned_req.numel())
         if n_owned > 0:
@@ -2793,18 +2828,60 @@ class KimiK3DecoderLayer(nn.Module):
         zero_allocator: BumpAllocator,
         prev_topk_indices: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """Whole-graph capture path: run the module on the permuted bucket
-        rows (owned front-packed via the backend's static perm buffer) with
-        the static owned metadata, then un-permute with a row-masked
-        index_add. Per replay, the hybrid backend refreshes perm / n /
-        out_cache_loc in place, so the captured kernels see the fresh
-        owned partition without re-running python."""
+        """Whole-graph capture path.
+
+        Token-shard mode (sp_attn_res): hidden_states is the shard (captured
+        at shard size by the graph).  No perm/index_select — run attention
+        directly on the shard with the shard-sized sub_fb prepared by the
+        backend's mla_graph_shard_view.  positions is full-batch-sized; slice
+        to the shard's contiguous range.  No all-reduce (output is sharded).
+
+        Owner-scatter mode: run the module on the permuted bucket rows
+        (owned front-packed via the backend's static perm buffer) with the
+        static owned metadata, then un-permute with a row-masked index_add
+        and all-reduce.  Per replay, the hybrid backend refreshes perm / n /
+        out_cache_loc in place.
+        """
         backend = get_attn_backend()
         full = getattr(backend, "full_attn_backend", None) or backend
+        sub_fb = getattr(full, "mla_scatter_sub_fb", None)
+        if sub_fb is None:
+            raise RuntimeError(
+                "SGLANG_MLA_OWNER_SCATTER graph buffers are missing on the "
+                "full-attention backend; the hybrid out-graph metadata path "
+                "must run before the model forward under whole-graph capture."
+            )
+
+        if mla_token_shard_active():
+            # Token-shard graph: hidden_states is the shard (shard-sized,
+            # captured by the graph from SP-MoE reduce-scatter output).
+            # Slice positions to the shard's contiguous range — a static
+            # slice (rank*shard, rank*shard+shard) capturable by the graph.
+            parallel = get_parallel()
+            rank = parallel.attn_tp_rank
+            tp = parallel.attn_tp_size
+            # In the graph positions is full-batch-sized (graph batch).
+            shard = positions.shape[0] // tp
+            lo = rank * shard
+            shard_positions = positions[lo : lo + shard]
+            sub_prev_topk = (
+                prev_topk_indices[lo : lo + shard]
+                if prev_topk_indices is not None
+                else None
+            )
+            sub_out, sub_topk = self._run_self_attn_full_batch(
+                hidden_states,
+                shard_positions,
+                sub_fb,
+                zero_allocator,
+                prev_topk_indices=sub_prev_topk,
+            )
+            return sub_out, sub_topk
+
+        # Owner-scatter graph path.
         perm = getattr(full, "mla_scatter_perm", None)
         n = getattr(full, "mla_scatter_n", None)
-        sub_fb = getattr(full, "mla_scatter_sub_fb", None)
-        if perm is None or n is None or sub_fb is None:
+        if perm is None or n is None:
             raise RuntimeError(
                 "SGLANG_MLA_OWNER_SCATTER graph buffers are missing on the "
                 "full-attention backend; the hybrid out-graph metadata path "
@@ -2953,25 +3030,29 @@ class KimiK3DecoderLayer(nn.Module):
         # Between attn-res layers hidden_states carries the previous layer's
         # un-added MLP delta and prefix_sum the prefix it extends (None at
         # stream start / PP entry, where hidden_states already is the head).
+        # Token-shard MLA: under sp_attn_res, MLA consumes the 1/attn_tp shard
+        # directly — no all-gather before attention, no reduce-scatter after.
+        # The layer returns sharded so the next MoE layer picks up the shard.
+        mla_shard = (
+            input_sharded
+            and mla_token_shard_active()
+            and mla_scatter_applies(forward_batch)
+            and isinstance(self.self_attn, DeepseekV2AttentionMLA)
+        )
 
         # ---- Aggregation 1: attention side. Write layers snapshot the
         # pre-attention prefix into the bank in the same call (fused into
         # the fast kernel; standalone copy on other paths). ----
         if input_sharded:
-            assert self._sp_moe
+            if not self._sp_moe and not mla_shard:
+                raise AssertionError(
+                    "input_sharded requires _sp_moe or mla_token_shard"
+                )
             input_rows = _sp_local_rows(hidden_states)
-            fused_ag = attn_res.forward_sp_all_gather(
-                hidden_states,
-                prefix_sum,
-                self.self_attention_res_proj,
-                self.self_attention_res_norm,
-                self.input_layernorm,
-                rows=input_rows,
-                write=self.is_block_write_layer,
-            )
-            if fused_ag is not None:
-                hidden_states, prefix_sum = fused_ag
-            else:
+            if mla_shard:
+                # MLA token-shard: aggregate/norm/snapshot only the shard
+                # rows, NO all-gather — attention runs on the 1/attn_tp
+                # shard directly.
                 hidden_states, prefix_sum = attn_res.forward(
                     hidden_states,
                     prefix_sum,
@@ -2981,9 +3062,31 @@ class KimiK3DecoderLayer(nn.Module):
                     rows=input_rows,
                     write=self.is_block_write_layer,
                 )
-                # Aggregate/norm and snapshot only this rank's rows, then
-                # gather the normalized tensor consumed by attention.
-                hidden_states = _sp_all_gather_rows(hidden_states)
+            else:
+                fused_ag = attn_res.forward_sp_all_gather(
+                    hidden_states,
+                    prefix_sum,
+                    self.self_attention_res_proj,
+                    self.self_attention_res_norm,
+                    self.input_layernorm,
+                    rows=input_rows,
+                    write=self.is_block_write_layer,
+                )
+                if fused_ag is not None:
+                    hidden_states, prefix_sum = fused_ag
+                else:
+                    hidden_states, prefix_sum = attn_res.forward(
+                        hidden_states,
+                        prefix_sum,
+                        self.self_attention_res_proj,
+                        self.self_attention_res_norm,
+                        self.input_layernorm,
+                        rows=input_rows,
+                        write=self.is_block_write_layer,
+                    )
+                    # Aggregate/norm and snapshot only this rank's rows, then
+                    # gather the normalized tensor consumed by attention.
+                    hidden_states = _sp_all_gather_rows(hidden_states)
         else:
             hidden_states, prefix_sum = attn_res.forward(
                 hidden_states,
@@ -3009,6 +3112,8 @@ class KimiK3DecoderLayer(nn.Module):
         # SP-MoE takes precedence (reduce-scatter to this rank's token shard);
         # otherwise the fused all-reduce when enabled; otherwise o_proj already
         # reduced itself (use_dp_attention_reduce, on when neither is active).
+        # MLA token-shard skips this entirely: MLA replication → full heads,
+        # no partial sums, o_proj.reduce_results=False → output is complete.
         rows = None
         shard_lo = -1
         agg2_fused = False
@@ -3061,20 +3166,36 @@ class KimiK3DecoderLayer(nn.Module):
 
         # ---- Aggregation 2: MLP side (on the shard under SP-MoE) ----
         if not agg2_fused:
-            hidden_states, prefix_sum = attn_res.forward(
-                hidden_states,
-                prefix_sum,
-                self.mlp_res_proj,
-                self.mlp_res_norm,
-                self.post_attention_layernorm,
-                rows=rows,
-            )
+            if mla_shard:
+                # MLA token-shard: aggregate only the shard rows.
+                input_rows = _sp_local_rows(hidden_states)
+                hidden_states, prefix_sum = attn_res.forward(
+                    hidden_states,
+                    prefix_sum,
+                    self.mlp_res_proj,
+                    self.mlp_res_norm,
+                    self.post_attention_layernorm,
+                    rows=input_rows,
+                )
+            else:
+                hidden_states, prefix_sum = attn_res.forward(
+                    hidden_states,
+                    prefix_sum,
+                    self.mlp_res_proj,
+                    self.mlp_res_norm,
+                    self.post_attention_layernorm,
+                    rows=rows,
+                )
 
         # ---- MLP (consumes +prefix_sum: MoE folds it into the 3-way tail
         # add, dense adds it after down_proj) ----
         out = self.mlp(
             hidden_states, prefix_sum=prefix_sum, forward_batch=forward_batch
         )
+        if mla_shard:
+            # MLA token-shard: output stays sharded (1/attn_tp) for the next
+            # MoE layer to consume directly.
+            return out, None, True, topk_indices
         if shard_lo >= 0:
             if keep_sharded:
                 return out, None, True, topk_indices
@@ -3229,6 +3350,13 @@ class KimiK3LinearModel(nn.Module):
             and self.dspark_layers_to_capture is None
             and k3_sp_collective.enabled()
         )
+        # Token-shard MLA: when the SP-MoE pipeline keeps its output sharded
+        # (sp_attn_res), MLA consumes the 1/attn_tp shard directly — no
+        # all-gather before attention, no reduce-scatter after.  The flag is
+        # deterministic (config/env only) so setting it once per forward is
+        # sufficient; the backend's graph-metadata planner reads it before
+        # graph replay to pick the shard-sized sub_fb.
+        set_mla_token_shard_active(sp_attn_res and mla_owner_scatter_enabled())
         sp_sharded = False
         aux_hidden_states = []
 
@@ -3253,7 +3381,23 @@ class KimiK3LinearModel(nn.Module):
         index_topk_share = IndexTopKShareState(forward_batch, initial_topk_indices)
 
         for i in range(self.start_layer, self.end_layer):
-            if sp_sharded and not self.layers[i]._sp_moe:
+            # Token-shard MLA: when sp_attn_res keeps the MoE output sharded,
+            # MLA consumes the 1/attn_tp shard directly (no all-gather).  The
+            # main loop would otherwise all-gather before every non-SP-MoE
+            # layer, re-expanding the batch and breaking the "MLA input =
+            # 1/attn_tp" invariant.  Skip the gather for MLA layers under
+            # token-shard so sp_sharded stays True into the layer.
+            if (
+                sp_sharded
+                and not self.layers[i]._sp_moe
+                and not (
+                    mla_token_shard_active()
+                    and mla_scatter_applies(forward_batch)
+                    and isinstance(
+                        self.layers[i].self_attn, DeepseekV2AttentionMLA
+                    )
+                )
+            ):
                 hidden_states = _sp_all_gather_rows(hidden_states)
                 sp_sharded = False
             with get_global_expert_distribution_recorder().with_current_layer(i):
