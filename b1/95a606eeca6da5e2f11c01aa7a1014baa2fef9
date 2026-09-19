@@ -1,0 +1,37 @@
+python/sglang/srt/models/kimi_k3.py
+  s_235e8fd2ecfc96::t_156d83c027a910 468-473,488-497
+  s_235e8fd2ecfc96::t_1065011944814d 499-500
+  s_235e8fd2ecfc96::t_aa7871df8bf6b5 466-467,479-481
+  s_235e8fd2ecfc96::t_fab87f96835451 508-509,511
+  s_235e8fd2ecfc96::t_c033c0848dfd16 1011-1020,1023
+  s_235e8fd2ecfc96::t_5f28484f67a50f 460-465,474-477,482-487,498,501-507,510,512
+  s_235e8fd2ecfc96::t_fc3ec62d5509a7 478
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "b195a606eeca6da5e2f11c01aa7a1014baa2fef9",
+  "prompts": {},
+  "sessions": {
+    "s_235e8fd2ecfc96": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6aae037d9f1ffdd0413a25f3",
+        "model": "Doubao-Seed-2.1-pro__dev"
+      },
+      "human_author": "liupeng <782420244@qq.com>",
+      "custom_attributes": {
+        "tool_name": "Edit",
+        "client_type": "ide",
+        "tool_use_id": "6aae0dfa9f1ffdd0413a26da",
+        "display_model_name": "Doubao-Seed-2.1-Pro-0915",
+        "session_id": "6aae037d9f1ffdd0413a25f3",
+        "external_session_id": "6aae037d9f1ffdd0413a25f3",
+        "edit_kind": "file_edit",
+        "operation_id": "6aae0dfa9f1ffdd0413a26da",
+        "source_scene": "agent",
+        "runtime_client": "trae-tob-git-ai"
+      }
+    }
+  }
+}
