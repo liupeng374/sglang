@@ -457,14 +457,59 @@ class KimiK3MoE(nn.Module):
         self.alt_stream = alt_stream
         self._dp_attention = is_dp_attention_enabled()
 
-        fake_topk = torch.arange(config.n_routed_experts)
-        fake_topk = torch.cat([fake_topk[::2], fake_topk[1::2]])
-        self.tp_rank = get_parallel().tp_rank
-        fake_topk = torch.cat([
-            fake_topk[self.tp_rank * config.n_routed_experts // self.tp_size::1],
-            fake_topk[:self.tp_rank * config.n_routed_experts // self.tp_size:1]
-        ])
-        self.fake_topk = fake_topk.repeat(512).view(-1, 16).to(torch.int32).npu()
+        # Debug-only static routing table consumed when ASCEND_FAKE_TOPK=1.
+        # EP layout: the token dispatcher shards experts by contiguous global
+        # id range, so expert e lives on EP rank e // (num_experts // ep_size).
+        # Slot g = token * top_k + j is assigned rank (g % ep_size) and walks
+        # that rank's local experts via g // ep_size, i.e.
+        #   e = (g % ep_size) * local + g // ep_size.
+        # Every token fans out across the EP ranks and the per-rank load stays
+        # within +/-1 for ANY token count (each expert is hit exactly once
+        # every num_experts / top_k tokens). When an EP a2a backend is active
+        # (DeepEP / FuseEP / ...) the ranks hold disjoint token shards, so each
+        # rank starts reading the table at a row offset by its EP rank, making
+        # the combined dispatch perfectly balanced. Without a2a every rank
+        # computes the same (DP-gathered, or replicated) batch and must route
+        # each token identically, so the offset stays 0.
+        # Fall back to the legacy strided/tp-rotated table when experts are not
+        # evenly divisible by the EP domain (e.g. redundant expert replicas).
+        num_experts = config.n_routed_experts
+        top_k = config.num_experts_per_token
+        self._fake_topk_period = num_experts // top_k
+        parallel = get_parallel()
+        ep_size = parallel.moe_ep_size
+        self._fake_topk_row_offset = 0
+        if ep_size > 1 and num_experts % ep_size == 0:
+            num_local_experts = num_experts // ep_size
+            slot = torch.arange(num_experts, dtype=torch.int64)
+            fake_experts = (
+                (slot % ep_size) * num_local_experts + slot // ep_size
+            )
+            _a2a_backend = get_moe_a2a_backend()
+            scattered_inputs = (
+                _a2a_backend.is_megamoe()
+                or _a2a_backend.is_deepep()
+                or _a2a_backend.is_mooncake()
+                or _a2a_backend.is_ascend_fuseep()
+                or _a2a_backend.is_mori()
+            )
+            if scattered_inputs:
+                self._fake_topk_row_offset = parallel.moe_ep_rank
+        else:
+            tp_rank = parallel.tp_rank
+            shift = tp_rank * num_experts // self.tp_size
+            fake_experts = torch.arange(num_experts)
+            fake_experts = torch.cat(
+                [fake_experts[::2], fake_experts[1::2]]
+            )
+            fake_experts = torch.cat(
+                [fake_experts[shift:], fake_experts[:shift]]
+            )
+        # The table stores one routing period (num_experts / top_k rows);
+        # _select_experts wraps row indices modulo the period.
+        self.fake_topk = (
+            fake_experts.reshape(-1, top_k).to(torch.int32).npu()
+        )
 
         self.use_latent_moe = config.routed_expert_hidden_size is not None
         # Merged front weight ([H, gate_up + E + latent]), built after weight
@@ -963,9 +1008,19 @@ class KimiK3MoE(nn.Module):
             from sglang.srt.layers.moe.topk import (
                 StandardTopKOutput,
             )
+            num_tokens = hidden_states.shape[0]
+            # Index the periodically repeated table with a per-rank phase so
+            # token shards across EP/DP ranks complement each other.
+            row_idx = (
+                torch.arange(
+                    num_tokens,
+                    # device=hidden_states.device,
+                )
+                + self._fake_topk_row_offset
+            ) % self._fake_topk_period
             topk_output = StandardTopKOutput(
                 topk_output.topk_weights,
-                self.fake_topk[:hidden_states.shape[0]],
+                self.fake_topk[row_idx],
                 topk_output.router_logits,
             )
             return topk_output
