@@ -1,0 +1,52 @@
+python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py
+  s_8a2caafd0822ea::t_cf1aaa7caee872 45
+  s_8a2caafd0822ea::t_696e7a9a41caba 1061,1066,1080,1085,1099
+python/sglang/srt/models/kimi_k3.py
+  s_8a2caafd0822ea::t_41c417b8a249b4 3053
+  s_8a2caafd0822ea::t_4970025b3de529 3493
+  s_8a2caafd0822ea::t_ce9733324892d0 2875,2894
+  s_8a2caafd0822ea::t_71a30fa34f827b 2611,2619,2631,2633
+  s_8a2caafd0822ea::t_13359c068aae0f 3068
+  s_8a2caafd0822ea::t_24474eab269be6 2648
+  s_8a2caafd0822ea::t_81fa88cc7aeb66 2794
+  s_8a2caafd0822ea::t_87088fb25e3e99 3214,3218,3222,3224
+  s_8a2caafd0822ea::t_12b4e0641e70b2 3425,3428-3429
+  s_8a2caafd0822ea::t_6159c11a882d9d 3089,3092,3106
+  s_8a2caafd0822ea::t_173ecf6d1b2874 3158,3164,3168
+  s_8a2caafd0822ea::t_1f00fe98fc46a0 2777
+  s_8a2caafd0822ea::t_fbaf43f8a60a70 2709
+  s_8a2caafd0822ea::t_0c1725230eb923 3442
+  s_8a2caafd0822ea::t_6620ca24721a0c 3383
+  s_8a2caafd0822ea::t_6c9ecb9f8b23e6 2717
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "cfb6c414bce26870d98980cc1a6fcbc634205bc7",
+  "prompts": {},
+  "sessions": {
+    "s_8a2caafd0822ea": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6aad29e39f1ffdd0413a236d",
+        "model": "glm-5.2__dev"
+      },
+      "human_author": "liupeng <782420244@qq.com>",
+      "custom_attributes": {
+        "runtime_client": "trae-tob-git-ai",
+        "session_id": "6aad29e39f1ffdd0413a236d",
+        "tool_use_id": "6aae52b29f1ffdd0413a2b85",
+        "display_model_name": "GLM-5.2",
+        "included_file_count": "21",
+        "external_session_id": "6aad29e39f1ffdd0413a236d",
+        "edit_kind": "bash",
+        "client_type": "ide",
+        "operation_id": "6aae52b29f1ffdd0413a2b85",
+        "original_file_count": "21",
+        "checkpoint_content_bytes": "433364",
+        "tool_name": "RunCommand",
+        "source_scene": "agent"
+      }
+    }
+  }
+}
