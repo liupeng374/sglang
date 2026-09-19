@@ -81,6 +81,36 @@ _is_hip = is_hip()
 _USE_ROCM700A_WA = _is_hip and get_bool_env_var("SGLANG_USE_ROCM700A")
 _is_cpu = is_cpu()
 
+_MLA_OWNER_SCATTER: Optional[bool] = None
+
+
+def mla_owner_scatter_enabled() -> bool:
+    """MLA owner-scatter mode (SGLANG_MLA_OWNER_SCATTER=1).
+
+    Under DP attention with attn_tp > 1, each attn-tp rank runs the MLA
+    layers only for the requests it owns (req_pool_idx % attn_tp_size) with
+    FULL heads, instead of head-sharding every request across the group:
+
+    - MLA attention compute is no longer duplicated across the group;
+    - KV is written and read only on the owner rank (enables a follow-up
+      1/attn_tp KV-pool shrink);
+    - the per-layer o_proj head-shard all-reduce is replaced by a
+      capacity-padded all-gather that reassembles the per-owner row
+      partition (each row's attention output is produced on exactly one
+      rank, so the sum degenerates to a row placement).
+
+    Phase 1: eager paths only (the owned-row selection is per-step dynamic
+    and would be baked into a captured graph) and the KV pool stays
+    replicated (holey on non-owners), so every MLA consumer must go through
+    the same owner filter.
+    """
+    global _MLA_OWNER_SCATTER
+    if _MLA_OWNER_SCATTER is None:
+        _MLA_OWNER_SCATTER = get_bool_env_var("SGLANG_MLA_OWNER_SCATTER") and (
+            get_parallel().attn_tp_size > 1
+        )
+    return _MLA_OWNER_SCATTER
+
 
 class DpPaddingMode(IntEnum):
 

@@ -27,6 +27,7 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
 )
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
+from sglang.srt.layers.dp_attention import mla_owner_scatter_enabled
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_kv_cache
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
@@ -666,6 +667,19 @@ class AscendAttnBackend(AttentionBackend):
                 max_num_tokens,
                 dtype=torch.int64,
                 device=self.device,
+            )
+        # Owner-scatter MLA (SGLANG_MLA_OWNER_SCATTER): static buffers the
+        # captured model graph reads to select this rank's owned rows, and
+        # the persistent KV-write-target buffer captured by pointer inside
+        # the attention kernel launch. Refreshed in place per replay by
+        # HybridLinearAttnBackend.init_forward_metadata_out_graph.
+        if mla_owner_scatter_enabled():
+            self.mla_scatter_perm = torch.zeros(
+                max(max_bs, max_num_tokens), dtype=torch.long, device=self.device
+            )
+            self.mla_scatter_n = torch.zeros((), dtype=torch.long, device=self.device)
+            self.mla_scatter_out_cache_loc = torch.zeros(
+                max_num_tokens, dtype=torch.int64, device=self.device
             )
         # V4-specific extra graph buffers. Default no-op on the base class;
         # DeepseekV4AscendAttnBackend overrides.

@@ -1776,6 +1776,15 @@ class DeepseekV2AttentionMLA(
         self.is_nextn = is_nextn
         attn_tp_rank = get_parallel().attn_tp_rank
         attn_tp_size = get_parallel().attn_tp_size
+        from sglang.srt.layers.dp_attention import mla_owner_scatter_enabled
+
+        if mla_owner_scatter_enabled():
+            # Owner-scatter MLA (see dp_attention.mla_owner_scatter_enabled):
+            # every rank holds full heads and runs them only on the rows of
+            # the requests it owns, so the head-sharded projections replicate
+            # (attn-tp width collapses to 1 for weight construction only).
+            attn_tp_rank = 0
+            attn_tp_size = 1
         self.use_dsa = is_deepseek_dsa(config)
         self.dsa_enable_prefill_cp = dsa_enable_prefill_cp
         self.mla_enable_prefill_cp = mla_enable_prefill_cp

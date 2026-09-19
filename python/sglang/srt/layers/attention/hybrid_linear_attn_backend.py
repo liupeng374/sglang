@@ -29,6 +29,11 @@ from sglang.srt.layers.attention.mamba.replay_state_indices_validator import (
     validate_replay_state_indices_cpu,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.layers.dp_attention import mla_owner_scatter_enabled
+from sglang.srt.layers.mla_owner_scatter import (
+    mla_graph_owned_view,
+    mla_scatter_applies,
+)
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
@@ -1037,10 +1042,50 @@ class HybridLinearAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         in_capture: bool = False,
     ):
+        if (
+            mla_owner_scatter_enabled()
+            and mla_scatter_applies(forward_batch)
+            and not forward_batch.forward_mode.is_draft_extend_v2()
+        ):
+            # Owner-scatter MLA (dp_attention.mla_owner_scatter_enabled):
+            # the full-attention (MLA) child plans the owned subset
+            # front-packed to the graph bucket and its static perm / n /
+            # out_cache_loc buffers are refreshed in place — the captured
+            # model graph reads them to select this rank's rows. The
+            # linear/KDA child keeps the full local batch: its attention is
+            # head-sharded across the group and needs every request.
+            sub_fb, owned_rows, n_rows = mla_graph_owned_view(
+                forward_batch,
+                self._mla_scatter_out_cache_loc_buf(),
+            )
+            full = self.full_attn_backend
+            full.mla_scatter_perm[:n_rows].copy_(
+                owned_rows.to(torch.long)
+            )
+            full.mla_scatter_perm[n_rows:].zero_()
+            full.mla_scatter_n.fill_(n_rows)
+            full.mla_scatter_sub_fb = sub_fb
+            full.init_forward_metadata_out_graph(sub_fb, in_capture=in_capture)
+            self.linear_attn_backend.init_forward_metadata_out_graph(
+                forward_batch, in_capture=in_capture
+            )
+            return
         for attn_backend in self.attn_backend_list:
             attn_backend.init_forward_metadata_out_graph(
                 forward_batch, in_capture=in_capture
             )
+
+    def _mla_scatter_out_cache_loc_buf(self) -> Optional[torch.Tensor]:
+        """The full-attention child's persistent KV-write-target buffer for
+        owner-scatter graphs (captured by pointer inside the graph)."""
+        buf = getattr(self.full_attn_backend, "mla_scatter_out_cache_loc", None)
+        if buf is None:
+            raise RuntimeError(
+                "SGLANG_MLA_OWNER_SCATTER requires the full-attention "
+                "backend's graph state (mla_scatter_out_cache_loc); "
+                "init_cuda_graph_state must run with the flag enabled."
+            )
+        return buf
 
     def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
         return SharedReadEnds.max_of(

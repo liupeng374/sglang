@@ -120,6 +120,13 @@ from sglang.srt.configs.model_config import (
 )
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
+from sglang.srt.layers.dp_attention import mla_owner_scatter_enabled
+from sglang.srt.layers.mla_owner_scatter import (
+    mla_graph_owned_view,
+    mla_owned_view,
+    mla_scatter_applies,
+    mla_scatter_row_partition,
+)
 from sglang.srt.multimodal.encoder_preprocessing import EncoderMediaProcessorConfig
 from sglang.srt.multimodal.kimi_k3_image_processing import (
     DEFERRED_PREPROCESSING_KEY,
@@ -2234,18 +2241,32 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
             # within the attn-TP group itself — the default full-TP collective
             # is the wrong group at attn_tp>1 and deadlocks against idle DP
             # ranks.
-            self.o_proj.use_dp_attention_reduce = True
+            #
+            # Owner-scatter mode skips this: the attention output is a
+            # per-owner row partition (each row produced on exactly one rank,
+            # full heads), assembled explicitly by a capacity-padded
+            # all-gather in _run_self_attn_owner_scattered — an all-reduce
+            # here would force full-width o_proj on every row of every rank.
+            if not mla_owner_scatter_enabled():
+                self.o_proj.use_dp_attention_reduce = True
         if self.use_output_gate:
             projection_size = config.num_attention_heads * config.v_head_dim
             # Shard by attn-TP to match the attention output (DSV2 MLA shards
             # heads across the attention-TP group, not the global TP group).
+            # Owner-scatter mode runs full heads, so the gate projects at
+            # full width too.
+            if mla_owner_scatter_enabled():
+                gate_tp_rank, gate_tp_size = 0, 1
+            else:
+                gate_tp_rank = get_parallel().attn_tp_rank
+                gate_tp_size = get_parallel().attn_tp_size
             self.g_proj = ColumnParallelLinear(
                 config.hidden_size,
                 projection_size,
                 bias=False,
                 quant_config=quant_config,
-                tp_rank=get_parallel().attn_tp_rank,
-                tp_size=get_parallel().attn_tp_size,
+                tp_rank=gate_tp_rank,
+                tp_size=gate_tp_size,
                 prefix=f"{prefix}.g_proj",
             )
             # Output gate must multiply the TP-local attention output right
@@ -2350,6 +2371,45 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
         return super().forward(
             positions, hidden_states, forward_batch, zero_allocator, **kwargs
         )
+
+
+# ---------------------------------------------------------------------------
+# MLA owner-scatter (SGLANG_MLA_OWNER_SCATTER, see
+# dp_attention.mla_owner_scatter_enabled): under attn_tp > 1 each rank runs
+# the MLA layers only for the requests it owns (req_pool_idx % attn_tp_size),
+# with full heads. The owned-view construction lives in
+# sglang.srt.layers.mla_owner_scatter (shared with the attention backends).
+# Assembly: each rank places its owned rows' outputs at their original
+# positions (zeros elsewhere) and an attn-tp all-reduce sums the per-owner
+# partition — each row is produced on exactly one rank, so the sum is exact
+# and the collective shape is the full local batch on every rank (eager and
+# graph share the contract).
+# ---------------------------------------------------------------------------
+
+
+def _mla_on_capturing_stream() -> bool:
+    """True while a whole-model (non-breakable) graph capture is recording on
+    the current stream. Replay never runs python, so this is only observed
+    during capture — exactly when the static graph buffers must be used."""
+    try:
+        return torch.cuda.is_current_stream_capturing()
+    except Exception:
+        return False
+
+
+def _mla_scatter_init_metadata(forward_batch: ForwardBatch, sub_fb: ForwardBatch):
+    """Re-plan the full-attention backend for the owned subset (once per
+    step). Only the full-attention (MLA) backend consumes it; the linear/KDA
+    backend keeps the runner-planned metadata for the full local batch. The
+    once-per-step flag lives on the (fresh-per-step) forward batch."""
+    if getattr(forward_batch, "_mla_scatter_meta_done", False):
+        return
+    backend = get_attn_backend()
+    full = getattr(backend, "full_attn_backend", None)
+    if full is None:
+        full = backend
+    full.init_forward_metadata(sub_fb)
+    forward_batch._mla_scatter_meta_done = True
 
 
 class KimiK3DecoderLayer(nn.Module):
@@ -2620,6 +2680,168 @@ class KimiK3DecoderLayer(nn.Module):
         )
 
     def _run_self_attn_inner(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        zero_allocator: BumpAllocator,
+        prev_topk_indices: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        # Owner-scatter dispatch: only decode and uniform-chain target_verify
+        # go through the owned subset; KDA layers, the draft model (is_nextn),
+        # draft-extend, and extend/prefill keep the full-batch flow.
+        if (
+            mla_owner_scatter_enabled()
+            and isinstance(self.self_attn, DeepseekV2AttentionMLA)
+            and not getattr(self.self_attn, "is_nextn", False)
+            and not forward_batch.forward_mode.is_draft_extend_v2()
+            and _mla_scatter_applies(forward_batch)
+        ):
+            return self._run_self_attn_owner_scattered(
+                hidden_states,
+                positions,
+                forward_batch,
+                zero_allocator,
+                prev_topk_indices=prev_topk_indices,
+            )
+        return self._run_self_attn_full_batch(
+            hidden_states,
+            positions,
+            forward_batch,
+            zero_allocator,
+            prev_topk_indices=prev_topk_indices,
+        )
+
+    def _run_self_attn_owner_scattered(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        zero_allocator: BumpAllocator,
+        prev_topk_indices: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Run attention only for this rank's owned requests, then reassemble
+        the per-owner row partition with an attn-tp all-reduce.
+
+        Two paths share the same assembly contract (full-batch-shaped
+        collective, so a rank that owns nothing still participates):
+        - eager / breakable-graph: compact owned sub-batch, metadata
+          re-planned once per step from the owned view;
+        - whole-graph capture/replay: the owned rows are front-packed into
+          the graph bucket through the backend's static perm buffer
+          (refreshed per replay by the hybrid backend's out-graph metadata
+          path), the module runs on the permuted bucket rows with the
+          static owned metadata, and the output is un-permuted with a
+          row-masked index_add before the all-reduce.
+        """
+        in_whole_graph = (
+            get_is_capture_mode()
+            or not is_in_breakable_cuda_graph()
+            and _mla_on_capturing_stream()
+        )
+        if in_whole_graph:
+            return self._run_self_attn_owner_scattered_graph(
+                hidden_states,
+                positions,
+                forward_batch,
+                zero_allocator,
+                prev_topk_indices=prev_topk_indices,
+            )
+
+        owned_req, rows, sub_fb = mla_owned_view(forward_batch)
+        n_owned = int(owned_req.numel())
+        if n_owned > 0:
+            _mla_scatter_init_metadata(forward_batch, sub_fb)
+            sub_out, sub_topk = self._run_self_attn_full_batch(
+                hidden_states[rows],
+                positions[rows],
+                sub_fb,
+                zero_allocator,
+                prev_topk_indices=(
+                    prev_topk_indices[rows]
+                    if prev_topk_indices is not None
+                    else None
+                ),
+            )
+        else:
+            sub_out = hidden_states.new_zeros(
+                (0, self.self_attn.o_proj.output_size)
+            )
+            sub_topk = None
+
+        out = mla_scatter_row_partition(
+            sub_out,
+            rows,
+            (hidden_states.shape[0], sub_out.shape[-1]),
+            get_parallel().attn_tp_group,
+        )
+        topk_out = None
+        if sub_topk is not None:
+            topk_out = torch.zeros(
+                (hidden_states.shape[0],) + tuple(sub_topk.shape[1:]),
+                dtype=sub_topk.dtype,
+                device=sub_topk.device,
+            )
+            topk_out.index_add_(0, rows, sub_topk)
+        return out, topk_out
+
+    def _run_self_attn_owner_scattered_graph(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        zero_allocator: BumpAllocator,
+        prev_topk_indices: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Whole-graph capture path: run the module on the permuted bucket
+        rows (owned front-packed via the backend's static perm buffer) with
+        the static owned metadata, then un-permute with a row-masked
+        index_add. Per replay, the hybrid backend refreshes perm / n /
+        out_cache_loc in place, so the captured kernels see the fresh
+        owned partition without re-running python."""
+        backend = get_attn_backend()
+        full = getattr(backend, "full_attn_backend", None) or backend
+        perm = getattr(full, "mla_scatter_perm", None)
+        n = getattr(full, "mla_scatter_n", None)
+        sub_fb = getattr(full, "mla_scatter_sub_fb", None)
+        if perm is None or n is None or sub_fb is None:
+            raise RuntimeError(
+                "SGLANG_MLA_OWNER_SCATTER graph buffers are missing on the "
+                "full-attention backend; the hybrid out-graph metadata path "
+                "must run before the model forward under whole-graph capture."
+            )
+        bucket = hidden_states.shape[0]
+        perm_slice = perm[:bucket]
+        sub_prev_topk = (
+            prev_topk_indices.index_select(0, perm_slice)
+            if prev_topk_indices is not None
+            else None
+        )
+        sub_out, sub_topk = self._run_self_attn_full_batch(
+            hidden_states.index_select(0, perm_slice),
+            positions.index_select(0, perm_slice),
+            sub_fb,
+            zero_allocator,
+            prev_topk_indices=sub_prev_topk,
+        )
+        mask = (
+            torch.arange(bucket, device=hidden_states.device) < n
+        ).to(sub_out.dtype).unsqueeze(-1)
+        out = hidden_states.new_zeros(hidden_states.shape[0], sub_out.shape[-1])
+        out.index_add_(0, perm_slice, sub_out * mask)
+        topk_out = None
+        if sub_topk is not None:
+            topk_out = torch.zeros(
+                (hidden_states.shape[0],) + tuple(sub_topk.shape[1:]),
+                dtype=sub_topk.dtype,
+                device=sub_topk.device,
+            )
+            topk_out.index_add_(0, perm_slice, sub_topk * mask)
+        group = get_parallel().attn_tp_group
+        out = group.all_reduce(out)
+        return out, topk_out
+
+    def _run_self_attn_full_batch(
         self,
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
