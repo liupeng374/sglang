@@ -168,13 +168,19 @@ def mla_owned_view(forward_batch: ForwardBatch):
 
 def mla_graph_owned_view(forward_batch: ForwardBatch, out_cache_loc_buf: torch.Tensor):
     """Graph capture/replay owned view: the owned subset FRONT-PACKED and
-    zero-padded to the graph bucket (forward_batch.batch_size), so the
-    captured full-attention kernels see a static-shaped batch where rows
-    [0, n_rows) are this rank's owned requests and the tail is inert padding
-    (zero seq_lens / out_cache_loc -> slot-0 writes, zero block tables).
+    zero-padded to the graph bucket, so the captured full-attention kernels
+    see a static-shaped batch where the front rows are this rank's owned
+    requests and the tail is inert padding (zero seq_lens / out_cache_loc ->
+    slot-0 writes, zero block tables).
 
-    out_cache_loc_buf is the backend's persistent static buffer (captured by
-    pointer inside the graph kernel launch); it is refreshed in place here.
+    Two granularities (verify packs draft-token blocks per request):
+    - request-level arrays (req_pool_indices / seq_lens / seq_lens_cpu) pad to
+      forward_batch.batch_size (the graph's request bucket) with n_owned_req;
+    - row-level arrays (positions / input_ids / out_cache_loc) pad to the
+      model row bucket with n_rows (= owned requests x draft_token_num for
+      verify). out_cache_loc_buf is the backend's persistent static buffer
+      (captured by pointer inside the graph kernel launch); refreshed in
+      place here.
 
     Returns (sub_fb, owned_rows, n_rows).
     """
@@ -183,43 +189,53 @@ def mla_graph_owned_view(forward_batch: ForwardBatch, out_cache_loc_buf: torch.T
         or forward_batch.forward_mode.is_target_verify()
     ), "graph owner-scatter supports decode/target_verify only"
     parallel = get_parallel()
-    bucket = forward_batch.batch_size
+    req_bucket = forward_batch.batch_size
+    row_bucket = (
+        forward_batch.input_ids.shape[0]
+        if forward_batch.input_ids is not None
+        else req_bucket
+    )
     device = forward_batch.req_pool_indices.device
     owner = _owner_of(forward_batch.req_pool_indices, parallel.attn_tp_size)
     owned_req = torch.nonzero(owner == parallel.attn_tp_rank, as_tuple=True)[0]
     owned_rows = _owned_rows_for_mode(forward_batch, owned_req, device)
+    n_req = owned_req.numel()
     n_rows = owned_rows.numel()
 
-    def pad_front(t: torch.Tensor, fill=0) -> torch.Tensor:
-        out = t.new_full((bucket,) + tuple(t.shape[1:]), fill)
+    def pad_front_req(t: torch.Tensor) -> torch.Tensor:
+        out = t.new_full((req_bucket,) + tuple(t.shape[1:]), 0)
+        out[:n_req] = t[:n_req]
+        return out
+
+    def pad_front_row(t: torch.Tensor) -> torch.Tensor:
+        out = t.new_full((row_bucket,) + tuple(t.shape[1:]), 0)
         out[:n_rows] = t[:n_rows]
         return out
 
     sub = copy.copy(forward_batch)
-    sub.batch_size = bucket
-    sub._original_batch_size = bucket
-    sub.req_pool_indices = pad_front(forward_batch.req_pool_indices)
+    sub.batch_size = req_bucket
+    sub._original_batch_size = req_bucket
+    sub.req_pool_indices = pad_front_req(forward_batch.req_pool_indices)
     if forward_batch.seq_lens is not None:
-        sub.seq_lens = pad_front(forward_batch.seq_lens)
+        sub.seq_lens = pad_front_req(forward_batch.seq_lens)
     if forward_batch.seq_lens_cpu is not None:
         if torch.is_tensor(forward_batch.seq_lens_cpu):
-            sub.seq_lens_cpu = pad_front(forward_batch.seq_lens_cpu)
+            sub.seq_lens_cpu = pad_front_req(forward_batch.seq_lens_cpu)
         else:
             sub.seq_lens_cpu = (
-                forward_batch.seq_lens_cpu[:n_rows]
-                + [0] * (bucket - n_rows)
+                list(forward_batch.seq_lens_cpu[:n_req]) + [0] * (req_bucket - n_req)
             )
     if forward_batch.positions is not None:
-        sub.positions = pad_front(forward_batch.positions)
+        sub.positions = pad_front_row(forward_batch.positions)
     if forward_batch.input_ids is not None:
-        sub.input_ids = pad_front(forward_batch.input_ids)
+        sub.input_ids = pad_front_row(forward_batch.input_ids)
     # The KV-write targets are captured by pointer inside the graph: refresh
     # the backend's persistent buffer in place (owned rows front-packed,
     # tail -> reserved slot 0).
     if forward_batch.out_cache_loc is not None:
         out_cache_loc_buf[:n_rows].copy_(forward_batch.out_cache_loc[owned_rows])
         out_cache_loc_buf[n_rows:].zero_()
-        sub.out_cache_loc = out_cache_loc_buf[:bucket]
+        sub.out_cache_loc = out_cache_loc_buf[:row_bucket]
     return sub, owned_rows, n_rows
 
 
