@@ -1,0 +1,31 @@
+python/sglang/srt/layers/mla_owner_scatter.py
+  s_235e8fd2ecfc96::t_d1d9515e0c0151 1-239
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "7db8483f13fecf5247969915d8fa35e0dc9f8809",
+  "prompts": {},
+  "sessions": {
+    "s_235e8fd2ecfc96": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6aae037d9f1ffdd0413a25f3",
+        "model": "Doubao-Seed-2.1-pro__dev"
+      },
+      "human_author": "liupeng <782420244@qq.com>",
+      "custom_attributes": {
+        "runtime_client": "trae-tob-git-ai",
+        "client_type": "ide",
+        "source_scene": "agent",
+        "external_session_id": "6aae037d9f1ffdd0413a25f3",
+        "display_model_name": "Doubao-Seed-2.1-Pro-0915",
+        "tool_name": "Edit",
+        "tool_use_id": "6aae0dfa9f1ffdd0413a26da",
+        "edit_kind": "file_edit",
+        "operation_id": "6aae0dfa9f1ffdd0413a26da",
+        "session_id": "6aae037d9f1ffdd0413a25f3"
+      }
+    }
+  }
+}
