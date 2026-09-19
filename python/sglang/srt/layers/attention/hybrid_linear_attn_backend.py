@@ -42,6 +42,7 @@ from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import (
     get_exec,
     get_memory,
+    get_parallel,
     get_spec,
     mamba_cache_chunk_size,
 )
@@ -1057,10 +1058,12 @@ class HybridLinearAttnBackend(AttentionBackend):
                 # needed (the shard is contiguous, no front-packing into a
                 # full bucket).  The model-side graph path runs attention
                 # directly on the shard with this sub_fb.
+                print(f"[MLA-DBG] init_forward_metadata_out_graph BRANCH=token_shard rank={get_parallel().attn_tp_rank} mode={forward_batch.forward_mode} bs={forward_batch.batch_size} token_shard={mla_token_shard_active()} owner_scatter={mla_owner_scatter_enabled()} => mla_graph_shard_view (shard-sized sub_fb, no perm)")
                 sub_fb, shard_rows, n_rows = mla_graph_shard_view(
                     forward_batch,
                     self._mla_scatter_out_cache_loc_buf(),
                 )
+                print(f"[MLA-DBG] init_forward_metadata_out_graph token_shard POST rank={get_parallel().attn_tp_rank} n_rows={n_rows} sub_fb_bs={sub_fb.batch_size} sub_fb_input_ids={tuple(sub_fb.input_ids.shape) if sub_fb.input_ids is not None else None}")
                 full.mla_scatter_n.fill_(n_rows)
                 full.mla_scatter_sub_fb = sub_fb
                 full.init_forward_metadata_out_graph(
@@ -1074,10 +1077,12 @@ class HybridLinearAttnBackend(AttentionBackend):
                 # this rank's rows.  The linear/KDA child keeps the full
                 # local batch: its attention is head-sharded across the
                 # group and needs every request.
+                print(f"[MLA-DBG] init_forward_metadata_out_graph BRANCH=owner_scatter rank={get_parallel().attn_tp_rank} mode={forward_batch.forward_mode} bs={forward_batch.batch_size} token_shard={mla_token_shard_active()} owner_scatter={mla_owner_scatter_enabled()} => mla_graph_owned_view (full-bucket + perm)")
                 sub_fb, owned_rows, n_rows = mla_graph_owned_view(
                     forward_batch,
                     self._mla_scatter_out_cache_loc_buf(),
                 )
+                print(f"[MLA-DBG] init_forward_metadata_out_graph owner_scatter POST rank={get_parallel().attn_tp_rank} n_rows={n_rows} owned_rows_n={int(owned_rows.numel())} sub_fb_bs={sub_fb.batch_size}")
                 full.mla_scatter_perm[:n_rows].copy_(
                     owned_rows.to(torch.long)
                 )
@@ -1091,6 +1096,7 @@ class HybridLinearAttnBackend(AttentionBackend):
                 forward_batch, in_capture=in_capture
             )
             return
+        print(f"[MLA-DBG] init_forward_metadata_out_graph BRANCH=default_full rank={get_parallel().attn_tp_rank} mode={forward_batch.forward_mode} bs={forward_batch.batch_size} owner_scatter={mla_owner_scatter_enabled()} scatter_applies={mla_scatter_applies(forward_batch)} token_shard={mla_token_shard_active()} => full-batch metadata for all backends")
         for attn_backend in self.attn_backend_list:
             attn_backend.init_forward_metadata_out_graph(
                 forward_batch, in_capture=in_capture

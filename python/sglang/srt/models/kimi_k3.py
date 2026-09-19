@@ -2608,6 +2608,7 @@ class KimiK3DecoderLayer(nn.Module):
         -1 when the result covers the full batch (non-SP mode, or fallback
         all-reduce for row counts not divisible by attn_tp)."""
         if not self._sp_moe:
+            print(f"[MLA-DBG] _finish_attn_reduce BRANCH=non_sp_moe rank={get_parallel().attn_tp_rank} hs={tuple(attn_out.shape)} sp_moe={self._sp_moe} allow_scatter={allow_scatter} => shard_lo=-1 (pass-through)")
             return attn_out, -1, False
         group = get_parallel().attn_tp_group
         num_tokens = attn_out.shape[0]
@@ -2615,6 +2616,7 @@ class KimiK3DecoderLayer(nn.Module):
             shard = num_tokens // group.world_size
             custom_out = k3_sp_collective.reduce_scatter_res(attn_out, residual)
             if custom_out is not None:
+                print(f"[MLA-DBG] _finish_attn_reduce BRANCH=custom_rs rank={group.rank_in_group} hs={tuple(attn_out.shape)} shard={shard} => shard_lo={group.rank_in_group * shard} hs_out={tuple(custom_out.shape)}")
                 return (
                     custom_out,
                     group.rank_in_group * shard,
@@ -2626,7 +2628,9 @@ class KimiK3DecoderLayer(nn.Module):
                 device=attn_out.device,
             )
             group.reduce_scatter_tensor(out, attn_out)
+            print(f"[MLA-DBG] _finish_attn_reduce BRANCH=fallback_rs rank={group.rank_in_group} hs={tuple(attn_out.shape)} shard={shard} ws={group.world_size} => shard_lo={group.rank_in_group * shard} hs_out={tuple(out.shape)}")
             return out, group.rank_in_group * shard, False
+        print(f"[MLA-DBG] _finish_attn_reduce BRANCH=all_reduce rank={group.rank_in_group} hs={tuple(attn_out.shape)} allow_scatter={allow_scatter} num_tokens={num_tokens} ws={group.world_size} => shard_lo=-1 (full all-reduce)")
         return group.all_reduce(attn_out), -1, False
 
     def _run_self_attn(
@@ -2641,6 +2645,7 @@ class KimiK3DecoderLayer(nn.Module):
         # attention metadata; pass hidden_states through shape-preserving
         # (same as the LayerCommunicator models' is_idle skip).
         if forward_batch.forward_mode.is_idle():
+            print(f"[MLA-DBG] _run_self_attn BRANCH=idle_early_return rank={get_parallel().attn_tp_rank} mode={forward_batch.forward_mode} hs={tuple(hidden_states.shape)} => skip MLA attention")
             return hidden_states, None
 
         # mlp-sync (DP attention OR MoE a2a/EP — require_mlp_sync) pads
@@ -2701,6 +2706,7 @@ class KimiK3DecoderLayer(nn.Module):
             and not forward_batch.forward_mode.is_draft_extend_v2()
             and mla_scatter_applies(forward_batch)
         ):
+            print(f"[MLA-DBG] _run_self_attn_inner BRANCH=owner_scattered rank={get_parallel().attn_tp_rank} mode={forward_batch.forward_mode} layer={self.layer_idx} hs={tuple(hidden_states.shape)} owner_scatter={mla_owner_scatter_enabled()} token_shard={mla_token_shard_active()} scatter_applies={mla_scatter_applies(forward_batch)} is_mla={isinstance(self.self_attn, DeepseekV2AttentionMLA)}")
             return self._run_self_attn_owner_scattered(
                 hidden_states,
                 positions,
@@ -2708,6 +2714,7 @@ class KimiK3DecoderLayer(nn.Module):
                 zero_allocator,
                 prev_topk_indices=prev_topk_indices,
             )
+        print(f"[MLA-DBG] _run_self_attn_inner BRANCH=full_batch rank={get_parallel().attn_tp_rank} mode={forward_batch.forward_mode} layer={self.layer_idx} hs={tuple(hidden_states.shape)} owner_scatter={mla_owner_scatter_enabled()} token_shard={mla_token_shard_active()} scatter_applies={mla_scatter_applies(forward_batch)} is_mla={isinstance(self.self_attn, DeepseekV2AttentionMLA)} is_nextn={getattr(self.self_attn, 'is_nextn', False)} is_draft_extend_v2={forward_batch.forward_mode.is_draft_extend_v2()}")
         return self._run_self_attn_full_batch(
             hidden_states,
             positions,
@@ -2767,6 +2774,7 @@ class KimiK3DecoderLayer(nn.Module):
             else forward_batch.batch_size
         )
         if mla_token_shard_active() and hidden_states.shape[0] < full_rows:
+            print(f"[MLA-DBG] _run_self_attn_owner_scattered BRANCH=token_shard rank={get_parallel().attn_tp_rank} mode={forward_batch.forward_mode} layer={self.layer_idx} hs={tuple(hidden_states.shape)} full_rows={full_rows} token_shard={mla_token_shard_active()} => MLA runs on shard directly")
             req_indices, rows, sub_fb = mla_shard_view(forward_batch)
             _mla_scatter_init_metadata(forward_batch, sub_fb)
             sub_out, sub_topk = self._run_self_attn_full_batch(
@@ -2783,6 +2791,7 @@ class KimiK3DecoderLayer(nn.Module):
             return sub_out, sub_topk
 
         # Owner-scatter (full-batch input): select owned rows, all-reduce.
+        print(f"[MLA-DBG] _run_self_attn_owner_scattered BRANCH=owner_scatter rank={get_parallel().attn_tp_rank} mode={forward_batch.forward_mode} layer={self.layer_idx} hs={tuple(hidden_states.shape)} full_rows={full_rows} token_shard={mla_token_shard_active()} => MLA runs on owned rows (full-batch input, select by req_pool_idx % tp)")
         owned_req, rows, sub_fb = mla_owned_view(forward_batch)
         n_owned = int(owned_req.numel())
         if n_owned > 0:
@@ -2863,6 +2872,7 @@ class KimiK3DecoderLayer(nn.Module):
             # In the graph positions is full-batch-sized (graph batch).
             shard = positions.shape[0] // tp
             lo = rank * shard
+            print(f"[MLA-DBG] _run_self_attn_owner_scattered_graph BRANCH=token_shard rank={rank} tp={tp} hs={tuple(hidden_states.shape)} positions={tuple(positions.shape)} shard={shard} lo={lo} => MLA runs on shard slice positions[lo:lo+shard]")
             shard_positions = positions[lo : lo + shard]
             sub_prev_topk = (
                 prev_topk_indices[lo : lo + shard]
@@ -2881,6 +2891,7 @@ class KimiK3DecoderLayer(nn.Module):
         # Owner-scatter graph path.
         perm = getattr(full, "mla_scatter_perm", None)
         n = getattr(full, "mla_scatter_n", None)
+        print(f"[MLA-DBG] _run_self_attn_owner_scattered_graph BRANCH=owner_scatter rank={get_parallel().attn_tp_rank} hs={tuple(hidden_states.shape)} positions={tuple(positions.shape)} bucket={hidden_states.shape[0]} token_shard={mla_token_shard_active()} => MLA runs on perm front-packed owned rows + all-reduce")
         if perm is None or n is None:
             raise RuntimeError(
                 "SGLANG_MLA_OWNER_SCATTER graph buffers are missing on the "
@@ -3039,6 +3050,7 @@ class KimiK3DecoderLayer(nn.Module):
             and mla_scatter_applies(forward_batch)
             and isinstance(self.self_attn, DeepseekV2AttentionMLA)
         )
+        print(f"[MLA-DBG] _forward_attn_residual ENTRY layer={self.layer_idx} rank={get_parallel().attn_tp_rank} mode={forward_batch.forward_mode} hs={tuple(hidden_states.shape)} input_sharded={input_sharded} keep_sharded={keep_sharded} sp_moe={self._sp_moe} mla_shard={mla_shard} token_shard={mla_token_shard_active()} scatter_applies={mla_scatter_applies(forward_batch)} is_mla={isinstance(self.self_attn, DeepseekV2AttentionMLA)}")
 
         # ---- Aggregation 1: attention side. Write layers snapshot the
         # pre-attention prefix into the bank in the same call (fused into
@@ -3053,6 +3065,7 @@ class KimiK3DecoderLayer(nn.Module):
                 # MLA token-shard: aggregate/norm/snapshot only the shard
                 # rows, NO all-gather — attention runs on the 1/attn_tp
                 # shard directly.
+                print(f"[MLA-DBG] _forward_attn_residual AGG1 BRANCH=mla_shard layer={self.layer_idx} rank={get_parallel().attn_tp_rank} hs={tuple(hidden_states.shape)} input_rows={input_rows} => attn_res.forward on shard rows (no all-gather)")
                 hidden_states, prefix_sum = attn_res.forward(
                     hidden_states,
                     prefix_sum,
@@ -3073,8 +3086,10 @@ class KimiK3DecoderLayer(nn.Module):
                     write=self.is_block_write_layer,
                 )
                 if fused_ag is not None:
+                    print(f"[MLA-DBG] _forward_attn_residual AGG1 BRANCH=sp_moe_fused_ag layer={self.layer_idx} rank={get_parallel().attn_tp_rank} hs={tuple(hidden_states.shape)} input_rows={input_rows} => forward_sp_all_gather fused")
                     hidden_states, prefix_sum = fused_ag
                 else:
+                    print(f"[MLA-DBG] _forward_attn_residual AGG1 BRANCH=sp_moe_ag_fallback layer={self.layer_idx} rank={get_parallel().attn_tp_rank} hs={tuple(hidden_states.shape)} input_rows={input_rows} => attn_res.forward + _sp_all_gather_rows")
                     hidden_states, prefix_sum = attn_res.forward(
                         hidden_states,
                         prefix_sum,
@@ -3088,6 +3103,7 @@ class KimiK3DecoderLayer(nn.Module):
                     # gather the normalized tensor consumed by attention.
                     hidden_states = _sp_all_gather_rows(hidden_states)
         else:
+            print(f"[MLA-DBG] _forward_attn_residual AGG1 BRANCH=full_batch layer={self.layer_idx} rank={get_parallel().attn_tp_rank} hs={tuple(hidden_states.shape)} => attn_res.forward on full batch (rows=None)")
             hidden_states, prefix_sum = attn_res.forward(
                 hidden_states,
                 prefix_sum,
@@ -3139,14 +3155,17 @@ class KimiK3DecoderLayer(nn.Module):
             else:
                 fused_rs = None
             if fused_rs is not None:
+                print(f"[MLA-DBG] _forward_attn_residual OPROJ BRANCH=sp_moe_fused_rs layer={self.layer_idx} rank={group.rank_in_group} hs={tuple(hidden_states.shape)} fused_rows={fused_rows} => forward_sp_reduce_scatter fused, shard_lo={fused_rows.start}")
                 hidden_states, prefix_sum = fused_rs
                 rows = fused_rows
                 shard_lo = fused_rows.start
                 agg2_fused = True
             else:
+                print(f"[MLA-DBG] _forward_attn_residual OPROJ BRANCH=sp_moe_finish_attn_reduce layer={self.layer_idx} rank={group.rank_in_group} hs={tuple(hidden_states.shape)} fused_rows={fused_rows} => _finish_attn_reduce fallback")
                 hidden_states, shard_lo, residual_fused = self._finish_attn_reduce(
                     hidden_states, allow_scatter=True, residual=prefix_sum
                 )
+                print(f"[MLA-DBG] _forward_attn_residual OPROJ POST finish_attn_reduce layer={self.layer_idx} rank={group.rank_in_group} hs={tuple(hidden_states.shape)} shard_lo={shard_lo} residual_fused={residual_fused}")
                 if shard_lo >= 0:
                     rows = slice(shard_lo, shard_lo + hidden_states.shape[0])
                     if residual_fused:
@@ -3192,13 +3211,17 @@ class KimiK3DecoderLayer(nn.Module):
         out = self.mlp(
             hidden_states, prefix_sum=prefix_sum, forward_batch=forward_batch
         )
+        print(f"[MLA-DBG] _forward_attn_residual EXIT layer={self.layer_idx} rank={get_parallel().attn_tp_rank} hs_in={tuple(hidden_states.shape)} hs_out={tuple(out.shape)} mla_shard={mla_shard} shard_lo={shard_lo} keep_sharded={keep_sharded} sp_moe={self._sp_moe}")
         if mla_shard:
             # MLA token-shard: output stays sharded (1/attn_tp) for the next
             # MoE layer to consume directly.
+            print(f"[MLA-DBG] _forward_attn_residual RETURN BRANCH=mla_shard layer={self.layer_idx} rank={get_parallel().attn_tp_rank} hs_out={tuple(out.shape)} => return sharded (sp_sharded=True, no all-gather)")
             return out, None, True, topk_indices
         if shard_lo >= 0:
             if keep_sharded:
+                print(f"[MLA-DBG] _forward_attn_residual RETURN BRANCH=sp_moe_keep_sharded layer={self.layer_idx} rank={get_parallel().attn_tp_rank} hs_out={tuple(out.shape)} shard_lo={shard_lo} => return sharded (sp_sharded=True, keep_sharded=True)")
                 return out, None, True, topk_indices
+            print(f"[MLA-DBG] _forward_attn_residual RETURN BRANCH=sp_moe_all_gather layer={self.layer_idx} rank={get_parallel().attn_tp_rank} hs_out={tuple(out.shape)} shard_lo={shard_lo} => _sp_all_gather_rows to full, return sp_sharded=False")
             out = _sp_all_gather_rows(out)
         return out, None, False, topk_indices
 
@@ -3357,6 +3380,7 @@ class KimiK3LinearModel(nn.Module):
         # sufficient; the backend's graph-metadata planner reads it before
         # graph replay to pick the shard-sized sub_fb.
         set_mla_token_shard_active(sp_attn_res and mla_owner_scatter_enabled())
+        print(f"[MLA-DBG] KimiK3LinearModel.forward ENTRY rank={get_parallel().attn_tp_rank} tp={get_parallel().attn_tp_size} mode={forward_batch.forward_mode} bs={forward_batch.batch_size} hs={tuple(hidden_states.shape)} sp_attn_res={sp_attn_res} owner_scatter={mla_owner_scatter_enabled()} token_shard={mla_token_shard_active()} k3_sp_collective={k3_sp_collective.enabled()} SGLANG_K3_SP_ATTN_RES={envs.SGLANG_K3_SP_ATTN_RES.get()} pp_ws={self.pp_group.world_size} dspark_capture={self.dspark_layers_to_capture is not None}")
         sp_sharded = False
         aux_hidden_states = []
 
@@ -3398,8 +3422,11 @@ class KimiK3LinearModel(nn.Module):
                     )
                 )
             ):
+                print(f"[MLA-DBG] main_loop ALL_GATHER layer={i} rank={get_parallel().attn_tp_rank} sp_sharded={sp_sharded} sp_moe={self.layers[i]._sp_moe} token_shard={mla_token_shard_active()} scatter_applies={mla_scatter_applies(forward_batch)} is_mla={isinstance(self.layers[i].self_attn, DeepseekV2AttentionMLA)} hs_before={tuple(hidden_states.shape)} => _sp_all_gather_rows to full")
                 hidden_states = _sp_all_gather_rows(hidden_states)
                 sp_sharded = False
+            elif sp_sharded and not self.layers[i]._sp_moe:
+                print(f"[MLA-DBG] main_loop SKIP_ALL_GATHER layer={i} rank={get_parallel().attn_tp_rank} sp_sharded={sp_sharded} sp_moe={self.layers[i]._sp_moe} token_shard={mla_token_shard_active()} scatter_applies={mla_scatter_applies(forward_batch)} is_mla={isinstance(self.layers[i].self_attn, DeepseekV2AttentionMLA)} hs={tuple(hidden_states.shape)} => keep sp_sharded=True (MLA token-shard or SP-MoE)")
             with get_global_expert_distribution_recorder().with_current_layer(i):
                 hidden_states, residual, sp_sharded, topk_indices = self.layers[i](
                     positions=positions,
@@ -3412,6 +3439,7 @@ class KimiK3LinearModel(nn.Module):
                     keep_sharded=sp_attn_res,
                     prev_topk_indices=index_topk_share.topk_indices,
                 )
+                print(f"[MLA-DBG] main_loop POST_LAYER layer={i} rank={get_parallel().attn_tp_rank} sp_moe={self.layers[i]._sp_moe} hs_out={tuple(hidden_states.shape)} sp_sharded={sp_sharded} keep_sharded_in={sp_attn_res}")
                 index_topk_share.update(topk_indices)
             if (
                 self.dspark_layers_to_capture is not None
@@ -3462,6 +3490,7 @@ class KimiK3LinearModel(nn.Module):
             if attn_res is not None:
                 # ---- Final aggregation (output side, folds delayed add) ----
                 if sp_sharded:
+                    print(f"[MLA-DBG] FINAL_AGG BRANCH=sp_sharded rank={get_parallel().attn_tp_rank} hs={tuple(hidden_states.shape)} sp_sharded={sp_sharded} => forward_sp_all_gather to full")
                     output_rows = _sp_local_rows(hidden_states)
                     fused_output = attn_res.forward_sp_all_gather(
                         hidden_states,
