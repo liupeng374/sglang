@@ -1,0 +1,52 @@
+python/sglang/srt/layers/mla_owner_scatter.py
+  s_8a2caafd0822ea::t_224aa1b2b28f8f 385-387,389-399,434-438,440-442,445-447,449-450,453-455,457-459,466-470,472-474
+  s_8a2caafd0822ea::t_cd39cff4ae29d8 259-275
+  s_8a2caafd0822ea::t_2e3a0a93b001d2 23-45
+  s_8a2caafd0822ea::t_e61727cf7e53ea 295-384,388,400-433,439,443-444,448,451-452,456,460-465,471,475
+python/sglang/srt/models/kimi_k3.py
+  s_8a2caafd0822ea::t_7002a63514ba23 3353-3359
+  s_8a2caafd0822ea::t_7108928bab9abe 3384-3400
+  s_8a2caafd0822ea::t_0f7e67e46ef1f4 126,130-132
+  s_8a2caafd0822ea::t_9d2dcb1fc507e6 2740-2744,2760-2785,2831-2844,2847-2881,2884
+  s_8a2caafd0822ea::t_2a091471b2777f 3033-3041,3047-3050,3052-3055,3065-3089,3115-3116,3169-3188,3195-3198
+  s_8a2caafd0822ea::t_0007fd01e623d4 2702
+python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py
+  s_8a2caafd0822ea::t_6e5bb3ee59d5ab 1053-1089
+  s_8a2caafd0822ea::t_0d938352ca7747 35,37
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "162680f3268859411d66b74132ddc85b2882bf47",
+  "prompts": {},
+  "humans": {
+    "h_30a34a661c3284": {
+      "author": "liupeng <782420244@qq.com>"
+    }
+  },
+  "sessions": {
+    "s_8a2caafd0822ea": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6aad29e39f1ffdd0413a236d",
+        "model": "glm-5.2__dev"
+      },
+      "human_author": null,
+      "custom_attributes": {
+        "operation_id": "6aae3f6f9f1ffdd0413a2a78",
+        "display_model_name": "GLM-5.2",
+        "checkpoint_content_bytes": "442881",
+        "client_type": "ide",
+        "tool_name": "RunCommand",
+        "original_file_count": "22",
+        "session_id": "6aad29e39f1ffdd0413a236d",
+        "included_file_count": "22",
+        "source_scene": "agent",
+        "tool_use_id": "6aae3f6f9f1ffdd0413a2a78",
+        "edit_kind": "bash",
+        "runtime_client": "trae-tob-git-ai",
+        "external_session_id": "6aad29e39f1ffdd0413a236d"
+      }
+    }
+  }
+}
