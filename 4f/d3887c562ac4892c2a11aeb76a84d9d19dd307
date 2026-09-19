@@ -1,0 +1,46 @@
+python/sglang/srt/models/kimi_k3.py
+  s_8a2caafd0822ea::t_1485ec35372f79 2807-2911
+  s_8a2caafd0822ea::t_85efd3d0f207b8 2239-2246,2251-2257,2263-2264
+  s_8a2caafd0822ea::t_b1bce0724404e3 2371-2536
+  s_8a2caafd0822ea::t_abc801fd9f3e7c 9
+  s_8a2caafd0822ea::t_114bc16b9c4ec8 124
+python/sglang/srt/models/deepseek_v2.py
+  s_8a2caafd0822ea::t_a88e70b494505a 1779-1780,1782
+  s_8a2caafd0822ea::t_54edec4cf8a055 1781,1783-1787
+python/sglang/srt/layers/dp_attention.py
+  s_8a2caafd0822ea::t_fdd1f613938c0a 84-113
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "4fd3887c562ac4892c2a11aeb76a84d9d19dd307",
+  "prompts": {},
+  "humans": {
+    "h_30a34a661c3284": {
+      "author": "liupeng <782420244@qq.com>"
+    }
+  },
+  "sessions": {
+    "s_8a2caafd0822ea": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6aad29e39f1ffdd0413a236d",
+        "model": "glm-5.3-flash__max"
+      },
+      "human_author": "liupeng <782420244@qq.com>",
+      "custom_attributes": {
+        "source_scene": "unknown",
+        "external_session_id": "6aad29e39f1ffdd0413a236d",
+        "edit_kind": "file_edit",
+        "tool_id": "Edit",
+        "operation_id": "6aad945e9f1ffdd0413a256a",
+        "runtime_client": "trae-tob-git-ai",
+        "client_type": "ide",
+        "dedupe_key": "6aad29e39f1ffdd0413a236d:6aad945e9f1ffdd0413a256a:afterEdit:0e5af31c",
+        "tool_use_id": "6aad945e9f1ffdd0413a256a",
+        "tool_type": "agent",
+        "session_id": "6aad29e39f1ffdd0413a236d"
+      }
+    }
+  }
+}
