@@ -1,0 +1,39 @@
+python/sglang/srt/models/kimi_k3.py
+  s_8a2caafd0822ea::t_0007fd01e623d4 2698
+python/sglang/srt/layers/mla_owner_scatter.py
+  s_8a2caafd0822ea::t_cd39cff4ae29d8 236-252
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "2c146627cf206c21acd142a1b7cfd1afd3ffc2b7",
+  "prompts": {},
+  "humans": {
+    "h_30a34a661c3284": {
+      "author": "liupeng <782420244@qq.com>"
+    }
+  },
+  "sessions": {
+    "s_8a2caafd0822ea": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6aad29e39f1ffdd0413a236d",
+        "model": "glm-5.2__dev"
+      },
+      "human_author": "liupeng <782420244@qq.com>",
+      "custom_attributes": {
+        "edit_kind": "file_edit",
+        "external_session_id": "6aad29e39f1ffdd0413a236d",
+        "tool_id": "Edit",
+        "tool_use_id": "6aae1bca9f1ffdd0413a2869",
+        "operation_id": "6aae1bca9f1ffdd0413a2869",
+        "session_id": "6aad29e39f1ffdd0413a236d",
+        "dedupe_key": "6aad29e39f1ffdd0413a236d:6aae1bca9f1ffdd0413a2869:afterEdit:455b104c",
+        "client_type": "ide",
+        "tool_type": "agent",
+        "runtime_client": "trae-tob-git-ai",
+        "source_scene": "unknown"
+      }
+    }
+  }
+}
