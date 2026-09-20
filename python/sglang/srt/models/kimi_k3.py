@@ -3373,14 +3373,20 @@ class KimiK3LinearModel(nn.Module):
             and self.dspark_layers_to_capture is None
             and k3_sp_collective.enabled()
         )
-        # Token-shard MLA: when the SP-MoE pipeline keeps its output sharded
-        # (sp_attn_res), MLA consumes the 1/attn_tp shard directly — no
-        # all-gather before attention, no reduce-scatter after.  The flag is
-        # deterministic (config/env only) so setting it once per forward is
-        # sufficient; the backend's graph-metadata planner reads it before
-        # graph replay to pick the shard-sized sub_fb.
-        set_mla_token_shard_active(sp_attn_res and mla_owner_scatter_enabled())
-        print(f"[MLA-DBG] KimiK3LinearModel.forward ENTRY rank={get_parallel().attn_tp_rank} tp={get_parallel().attn_tp_size} mode={forward_batch.forward_mode} bs={forward_batch.batch_size} hs={tuple(hidden_states.shape)} sp_attn_res={sp_attn_res} owner_scatter={mla_owner_scatter_enabled()} token_shard={mla_token_shard_active()} k3_sp_collective={k3_sp_collective.enabled()} SGLANG_K3_SP_ATTN_RES={envs.SGLANG_K3_SP_ATTN_RES.get()} pp_ws={self.pp_group.world_size} dspark_capture={self.dspark_layers_to_capture is not None}")
+        # Token-shard MLA: decouple from sp_attn_res so the NPU (where
+        # k3_sp_collective / SGLANG_K3_SP_ATTN_RES don't apply) still keeps
+        # the SP-MoE reduce-scatter output sharded across MLA layers. The
+        # shard source is _finish_attn_reduce's standard reduce_scatter_tensor
+        # fallback (no k3_sp_collective needed); keep_sharded just skips the
+        # layer-end _sp_all_gather_rows so the shard carries into the next
+        # MLA layer, which runs directly on the 1/attn_tp shard.
+        _token_shard = (
+            mla_owner_scatter_enabled()
+            and mla_scatter_applies(forward_batch)
+        )
+        set_mla_token_shard_active(_token_shard)
+        _keep_sharded = sp_attn_res or _token_shard
+        print(f"[MLA-DBG] KimiK3LinearModel.forward ENTRY rank={get_parallel().attn_tp_rank} tp={get_parallel().attn_tp_size} mode={forward_batch.forward_mode} bs={forward_batch.batch_size} hs={tuple(hidden_states.shape)} sp_attn_res={sp_attn_res} owner_scatter={mla_owner_scatter_enabled()} token_shard={mla_token_shard_active()} _keep_sharded={_keep_sharded} k3_sp_collective={k3_sp_collective.enabled()} SGLANG_K3_SP_ATTN_RES={envs.SGLANG_K3_SP_ATTN_RES.get()} pp_ws={self.pp_group.world_size} dspark_capture={self.dspark_layers_to_capture is not None}")
         sp_sharded = False
         aux_hidden_states = []
 
@@ -3436,10 +3442,10 @@ class KimiK3LinearModel(nn.Module):
                     attn_res=attn_res,
                     zero_allocator=zero_allocator,
                     input_sharded=sp_sharded,
-                    keep_sharded=sp_attn_res,
+                    keep_sharded=_keep_sharded,
                     prev_topk_indices=index_topk_share.topk_indices,
                 )
-                print(f"[MLA-DBG] main_loop POST_LAYER layer={i} rank={get_parallel().attn_tp_rank} sp_moe={self.layers[i]._sp_moe} hs_out={tuple(hidden_states.shape)} sp_sharded={sp_sharded} keep_sharded_in={sp_attn_res}")
+                print(f"[MLA-DBG] main_loop POST_LAYER layer={i} rank={get_parallel().attn_tp_rank} sp_moe={self.layers[i]._sp_moe} hs_out={tuple(hidden_states.shape)} sp_sharded={sp_sharded} keep_sharded_in={_keep_sharded}")
                 index_topk_share.update(topk_indices)
             if (
                 self.dspark_layers_to_capture is not None
