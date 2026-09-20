@@ -1,0 +1,32 @@
+python/sglang/srt/models/kimi_k3.py
+  s_8a2caafd0822ea::t_b7406dc732c067 3386
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "4e2b05069ce0625f971f7967fe66a0c70e45b7eb",
+  "prompts": {},
+  "sessions": {
+    "s_8a2caafd0822ea": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6aad29e39f1ffdd0413a236d",
+        "model": "glm-5.2__dev"
+      },
+      "human_author": "liupeng <782420244@qq.com>",
+      "custom_attributes": {
+        "edit_kind": "file_edit",
+        "operation_id": "6aaf48ee9f1ffdd0413a2c5a",
+        "runtime_client": "trae-tob-git-ai",
+        "tool_id": "Edit",
+        "external_session_id": "6aad29e39f1ffdd0413a236d",
+        "tool_use_id": "6aaf48ee9f1ffdd0413a2c5a",
+        "source_scene": "unknown",
+        "client_type": "ide",
+        "dedupe_key": "6aad29e39f1ffdd0413a236d:6aaf48ee9f1ffdd0413a2c5a:afterEdit:0e5af31c",
+        "session_id": "6aad29e39f1ffdd0413a236d",
+        "tool_type": "agent"
+      }
+    }
+  }
+}
