@@ -1,0 +1,35 @@
+python/sglang/srt/models/kimi_k3.py
+  s_235e8fd2ecfc96::t_d001ba8e9cd067 1022-1023,1026
+  s_235e8fd2ecfc96::t_72646407762670 467-522
+  s_235e8fd2ecfc96::t_ecb1b2b8cdb091 411-416
+  s_235e8fd2ecfc96::t_c6c366ee065643 466
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "05ba234b3b827da23562b9a1c0dc83c79724e232",
+  "prompts": {},
+  "sessions": {
+    "s_235e8fd2ecfc96": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6aae037d9f1ffdd0413a25f3",
+        "model": "Doubao-Seed-2.1-pro__dev"
+      },
+      "human_author": "liupeng <782420244@qq.com>",
+      "custom_attributes": {
+        "session_id": "6aae037d9f1ffdd0413a25f3",
+        "client_type": "ide",
+        "tool_id": "Edit",
+        "dedupe_key": "6aae037d9f1ffdd0413a25f3:6ab1576e9f1ffdd0413a2ecb:afterEdit:0e5af31c",
+        "tool_type": "agent",
+        "tool_use_id": "6ab1576e9f1ffdd0413a2ecb",
+        "runtime_client": "trae-tob-git-ai",
+        "source_scene": "unknown",
+        "external_session_id": "6aae037d9f1ffdd0413a25f3",
+        "operation_id": "6ab1576e9f1ffdd0413a2ecb",
+        "edit_kind": "file_edit"
+      }
+    }
+  }
+}
