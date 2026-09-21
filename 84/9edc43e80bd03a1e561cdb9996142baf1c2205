@@ -1,0 +1,38 @@
+python/sglang/srt/mem_cache/pool_host/mla.py
+  s_aa013db1ee612f::t_45996db01b04d4 164-170
+python/sglang/srt/hardware_backend/npu/memory_pool_npu.py
+  s_aa013db1ee612f::t_085aeba4facea8 799-818
+  s_aa013db1ee612f::t_6f1c319ccfafbc 1042-1052
+python/sglang/srt/hardware_backend/npu/attention/ascend_backend.py
+  s_aa013db1ee612f::t_803fbf8a98911e 3648-3653
+  s_aa013db1ee612f::t_e1b4363605794d 3697-3699,3706,3726
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "849edc43e80bd03a1e561cdb9996142baf1c2205",
+  "prompts": {},
+  "sessions": {
+    "s_aa013db1ee612f": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6aaf40009f1ffdd0413a2bf0",
+        "model": "glm-5.3__dev"
+      },
+      "human_author": "liupeng <782420244@qq.com>",
+      "custom_attributes": {
+        "edit_kind": "file_edit",
+        "external_session_id": "6aaf40009f1ffdd0413a2bf0",
+        "source_scene": "unknown",
+        "client_type": "ide",
+        "session_id": "6aaf40009f1ffdd0413a2bf0",
+        "operation_id": "6aaf8ebe9f1ffdd0413a2dbf",
+        "runtime_client": "trae-tob-git-ai",
+        "tool_use_id": "6aaf8ebe9f1ffdd0413a2dbf",
+        "tool_id": "Edit",
+        "dedupe_key": "6aaf40009f1ffdd0413a2bf0:6aaf8ebe9f1ffdd0413a2dbf:afterEdit:e282d771",
+        "tool_type": "agent"
+      }
+    }
+  }
+}
