@@ -161,6 +161,13 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         # Ascend-specific: Aligns with NPUMLATokenToKVPool layout
         # Separately allocate k_buffer and v_buffer for easier data transfer.
         elif self.layout == "page_first_kv_split":
+            if getattr(self.device_pool, "use_flash_mla", False):
+                raise NotImplementedError(
+                    "hicache_mem_layout='page_first_kv_split' (NPU hierarchical "
+                    "cache / decode KV offload) only supports the split k/v "
+                    "NPUMLATokenToKVPool layout. Unset SGLANG_NPU_USE_FLASH_MLA "
+                    "to use hierarchical cache."
+                )
             base_dims = (
                 self.page_num,
                 self.layer_num,

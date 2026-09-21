@@ -3645,7 +3645,12 @@ class AscendAttnBackend(AttentionBackend):
             )
             return output.view(num_tokens, layer.tp_q_head_num * layer.v_head_dim)
         else:
-            c_kv, k_rope = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+            if self.use_flash_mla:
+                kv_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+                c_kv = kv_cache[..., : self.kv_lora_rank]
+                k_rope = kv_cache[..., self.kv_lora_rank :]
+            else:
+                c_kv, k_rope = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
             if is_fia_nz():
                 k_rope_cache = _reshape_kv_for_fia_nz(
                     k_rope, layer.tp_k_head_num, self.qk_rope_head_dim, self.page_size
@@ -3689,13 +3694,16 @@ class AscendAttnBackend(AttentionBackend):
                     self.forward_metadata.seq_lens_cpu_int.cpu().int().tolist()
                 )
 
+            # With use_flash_mla the head padding is disabled (q_head_num_padding
+            # is None), so fall back to the actual local head count.
+            num_heads = self.q_head_num_padding or layer.tp_q_head_num
             workspace = torch_npu._npu_fused_infer_attention_score_get_max_workspace(
                 q_nope,
                 c_kv_cache,
                 c_kv_cache,
                 query_rope=q_rope,
                 key_rope=k_rope_cache,
-                num_heads=self.q_head_num_padding,
+                num_heads=num_heads,
                 num_key_value_heads=layer.tp_k_head_num,
                 block_table=self.forward_metadata.block_tables,
                 block_size=self.page_size,
@@ -3715,7 +3723,7 @@ class AscendAttnBackend(AttentionBackend):
                 c_kv_cache,
                 query_rope=q_rope,
                 key_rope=k_rope_cache,
-                num_heads=self.q_head_num_padding,
+                num_heads=num_heads,
                 num_key_value_heads=layer.tp_k_head_num,
                 block_table=self.forward_metadata.block_tables,
                 block_size=self.page_size,
