@@ -161,22 +161,37 @@ def forward_sparsity_driven_kv_offload(
         # device-cache hits and host misses are copied into this buffer, the
         # device cache is refilled from it, and sparse attention consumes it
         # directly.
-        selected_kv_buffer = torch.zeros(
-            (
-                batch_size,
-                selected_kv_length,
-                num_kv_heads,
-                nope_head_dim + rope_head_dim,
-            ),
-            dtype=k.dtype,
-            device=backend.device,
+        selected_kv_buffer = sparse_kv_manager.take_prefetched_kv(
+            layer.layer_id, forward_batch, k.dtype, stream
         )
-        sparse_kv_manager.materialize_selected_kv(
-            layer, forward_batch, topk_indices, selected_kv_buffer, stream
-        )
+        prefetched = selected_kv_buffer is not None
+        if not prefetched:
+            selected_kv_buffer = torch.zeros(
+                (
+                    batch_size,
+                    selected_kv_length,
+                    num_kv_heads,
+                    nope_head_dim + rope_head_dim,
+                ),
+                dtype=k.dtype,
+                device=backend.device,
+            )
+            sparse_kv_manager.materialize_selected_kv(
+                layer, forward_batch, topk_indices, selected_kv_buffer, stream
+            )
 
-        _wait_stream_event(stream, sparse_kv_manager.hit_done)
-        _wait_stream_event(stream, sparse_kv_manager.miss_done)
+        if prefetched:
+            sparse_kv_manager.patch_current_kv(
+                selected_kv_buffer, topk_2d, k_nope, k_pe, forward_batch
+            )
+        else:
+            # Fork after the anchor's materialization has been enqueued. Side
+            # copies overlap this layer's SFA/FFN and intervening shared layers.
+            sparse_kv_manager.prefetch_shared_kv(
+                layer.layer_id, forward_batch, topk_indices, k.dtype
+            )
+            _wait_stream_event(stream, sparse_kv_manager.hit_done)
+            _wait_stream_event(stream, sparse_kv_manager.miss_done)
 
         selected_k_nope, selected_k_rope = selected_kv_buffer.split(
             [nope_head_dim, rope_head_dim], dim=-1
@@ -275,8 +290,9 @@ def forward_sparsity_driven_kv_offload(
             return_softmax_lse=False,
         )
 
-        _wait_stream_event(stream, sparse_kv_manager.refill_done)
-        _wait_stream_event(stream, sparse_kv_manager.slot_map_done)
+        if not prefetched:
+            _wait_stream_event(stream, sparse_kv_manager.refill_done)
+            _wait_stream_event(stream, sparse_kv_manager.slot_map_done)
 
         attn_out = ret[0] if isinstance(ret, tuple) else ret
         attn_out = attn_out[:, :, :num_query_heads, :].reshape(

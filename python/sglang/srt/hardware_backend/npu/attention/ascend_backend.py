@@ -453,10 +453,28 @@ class AscendAttnBackend(AttentionBackend):
                     SparseKVCacheManager,
                 )
 
+                from sglang.srt.configs.model_config import dsa_layer_skips_topk
+
+                # Keep the first implementation on full-batch target decode.
+                # PP and CP/token sharding require different ownership/row plans.
+                shared_index_layers = None
+                if (
+                    not self.is_draft_worker
+                    and get_parallel().pp_size == 1
+                    and get_parallel().attn_dcp_size == 1
+                    and get_parallel().attn_cp_size == 1
+                    and not envs.SGLANG_DISABLE_HISPARSE_PREFETCH.get()
+                ):
+                    config = model_runner.model_config.hf_config
+                    shared_index_layers = [
+                        dsa_layer_skips_topk(config, i)
+                        for i in range(config.num_hidden_layers)
+                    ]
                 self.sparse_kv_manager = SparseKVCacheManager(
                     model_runner.req_to_token_pool,
                     model_runner.token_to_kv_pool_allocator,
-                    sparse_topk,
+                    sparse_context_len=sparse_topk,
+                    shared_index_layers=shared_index_layers,
                 )
             register_sparse_kv_manager(self.sparse_kv_manager)
             logger.info(
@@ -631,6 +649,8 @@ class AscendAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         in_capture: bool = False,
     ):
+        if self.sparse_kv_manager is not None and not self.use_fused_sparse_kv:
+            self.sparse_kv_manager.reset_prefetch()
         self._report_c8_hit_statistics(in_capture=in_capture)
         bs = forward_batch.batch_size
         if in_capture:
@@ -662,6 +682,8 @@ class AscendAttnBackend(AttentionBackend):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
+        if self.sparse_kv_manager is not None and not self.use_fused_sparse_kv:
+            self.sparse_kv_manager.reset_prefetch()
         self._report_c8_hit_statistics()
         self.forward_metadata = ForwardMetadata()
         dense_mla_dcp_partial = self.dense_mla_dcp_target and (

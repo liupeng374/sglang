@@ -75,6 +75,7 @@ class SparseKVCacheManager:
         req_to_token_pool: ReqToTokenPool,
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
         sparse_context_len: int,
+        shared_index_layers: Optional[List[bool]] = None,
     ) -> None:
         enable_memory_saver = False
         memory_saver_adapter = TorchMemorySaverAdapter.create(
@@ -115,6 +116,27 @@ class SparseKVCacheManager:
         self._materialize_refill_stream = torch.npu.Stream()
         self._materialize_slot_map_stream = torch.npu.Stream()
 
+        # Reuse the model's IndexShare pattern. Each NPU layer retains its own
+        # slot map, so only top-k is shared, not the anchor's miss addresses.
+        self.prefetch_groups = {}
+        if shared_index_layers is not None and (
+            self.start_layer != 0 or len(shared_index_layers) != self.layer_num
+        ):
+            shared_index_layers = None
+        anchor = None
+        for offset, shared in enumerate(shared_index_layers or []):
+            layer_id = self.start_layer + offset
+            if not shared:
+                anchor = layer_id
+            elif anchor is not None:
+                self.prefetch_groups.setdefault(anchor, []).append(layer_id)
+        self.prefetch_stream = torch.npu.Stream() if self.prefetch_groups else None
+        self.prefetched_selected_kv = {}
+        self.prefetch_events = {
+            layer_id: tuple(torch.npu.Event() for _ in range(4))
+            for group in self.prefetch_groups.values()
+            for layer_id in group
+        }
         self.hit_done = torch.npu.Event()
         self.miss_done = torch.npu.Event()
         self.refill_done = torch.npu.Event()
@@ -685,6 +707,104 @@ class SparseKVCacheManager:
         k_nope, k_pe = kv_cat.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         return k_nope.contiguous(), k_pe.contiguous()
 
+    def reset_prefetch(self):
+        """Discard eager/capture bookkeeping at a forward boundary.
+
+        Graph replay uses captured buffers/events, not this Python dictionary.
+        Drain abandoned copies before releasing their tensors or reusing slots.
+        """
+        if self.prefetched_selected_kv:
+            self.prefetch_stream.synchronize()
+            self.prefetched_selected_kv.clear()
+
+    def prefetch_shared_kv(self, anchor_id, forward_batch, topk_indices, dtype):
+        """Launch the anchor group's copies before its attention computation."""
+        group = self.prefetch_groups.get(anchor_id)
+        if not group or not forward_batch.forward_mode.is_decode():
+            return
+        topk = normalize_batch_topk_indices(topk_indices)
+        # The existing copy kernel flattens destinations using top-k width.
+        if topk.shape != (forward_batch.batch_size, self.sparse_context_len):
+            return
+        # Quantized storage needs an explicit conversion contract, not an
+        # implicit dtype change on the prefetch path.
+        if dtype != self.store_dtype:
+            return
+        if any(layer_id in self.prefetched_selected_kv for layer_id in group):
+            self.reset_prefetch()
+        self.prefetch_stream.wait_stream(torch.npu.current_stream(self.device))
+        # These tensors originate on the producer stream but are read by the
+        # asynchronous planner. Keep their storage live until that read ends.
+        for tensor in (
+            topk, forward_batch.seq_lens, forward_batch.req_pool_indices
+        ):
+            tensor.record_stream(self.prefetch_stream)
+        with torch.npu.stream(self.prefetch_stream):
+            historical = torch.where(
+                topk < (forward_batch.seq_lens - 1).view(-1, 1),
+                topk,
+                torch.full_like(topk, -1),
+            )
+            for layer_id in group:
+                selected = torch.zeros(
+                    (forward_batch.batch_size, self.sparse_context_len,
+                     self.head_num, self.head_dim),
+                    dtype=dtype, device=self.device,
+                )
+                events = self.prefetch_events[layer_id]
+                self.materialize_selected_kv(
+                    layer_id, forward_batch, historical, selected,
+                    self.prefetch_stream, events=events,
+                )
+                # Keep planning/copy/refill ordered on the side stream. Main
+                # stream compute can proceed throughout the group's copies.
+                for event in events:
+                    _wait_stream_event(self.prefetch_stream, event)
+                self.prefetched_selected_kv[layer_id] = (
+                    forward_batch, selected, events
+                )
+
+    def take_prefetched_kv(self, layer_id, forward_batch, dtype, stream):
+        entry = self.prefetched_selected_kv.pop(layer_id, None)
+        if entry is None:
+            return None
+        batch, selected, events = entry
+        # Event waits order execution; record_stream separately prevents the
+        # side-stream allocation from being recycled during main-stream SFA.
+        selected.record_stream(stream)
+        for event in events:
+            _wait_stream_event(stream, event)
+        if (
+            batch is not forward_batch
+            or selected.shape != (
+                forward_batch.batch_size, self.sparse_context_len,
+                self.head_num, self.head_dim,
+            )
+            or selected.dtype != dtype
+        ):
+            return None
+        return selected
+
+    def patch_current_kv(self, selected, topk, k_nope, k_pe, forward_batch):
+        """Patch only selected current-token rows, without a full-buffer copy."""
+        batch, width = topk.shape
+        current = torch.cat((k_nope, k_pe), dim=-1)
+        valid = (
+            (topk == (forward_batch.seq_lens - 1).view(-1, 1))
+            & (forward_batch.seq_lens > 0).view(-1, 1)
+            & (forward_batch.req_pool_indices >= 0).view(-1, 1)
+            & (forward_batch.req_pool_indices < self.size).view(-1, 1)
+        )
+        src = torch.arange(batch, device=topk.device, dtype=torch.long)
+        src = src[:, None].expand(batch, width).reshape(-1).contiguous()
+        dst = torch.arange(batch * width, device=topk.device, dtype=torch.long)
+        unidex_copy_inplace(
+            current, selected, src, dst, valid.reshape(-1),
+            1, 2, block_dim=24,
+        )
+        # Historical refill intentionally excludes the current token. If it is
+        # selected next step, it misses once and is fetched from host storage.
+
     def materialize_selected_kv(
         self,
         layer: RadixAttention,
@@ -692,9 +812,14 @@ class SparseKVCacheManager:
         topk_indices: torch.Tensor,
         selected_kv_buffer: torch.Tensor,
         stream: torch.npu.Stream,
+        events=None,
     ) -> None:
         """Materialize top-k KV entries and refresh the device cache metadata."""
-        layer_idx = layer.layer_id - self.start_layer
+        layer_id = layer.layer_id if hasattr(layer, "layer_id") else int(layer)
+        layer_idx = layer_id - self.start_layer
+        hit_done, miss_done, refill_done, slot_map_done = events or (
+            self.hit_done, self.miss_done, self.refill_done, self.slot_map_done
+        )
         stream = stream if stream is not None else torch.npu.current_stream()
 
         with torch.npu.stream(stream):
@@ -788,7 +913,7 @@ class SparseKVCacheManager:
                 2,  #
                 block_dim=24,
             )
-            _record_stream_event(self._materialize_d2d_hit_stream, self.hit_done)
+            _record_stream_event(self._materialize_d2d_hit_stream, hit_done)
 
         # Copy host shared-memory misses into the selected KV buffer.
         with torch.npu.stream(self._materialize_h2d_miss_stream):
@@ -804,13 +929,13 @@ class SparseKVCacheManager:
                 block_dim=24,
                 src_ptr=self.dev_ptr_list[layer_idx],
             )
-            _record_stream_event(self._materialize_h2d_miss_stream, self.miss_done)
+            _record_stream_event(self._materialize_h2d_miss_stream, miss_done)
 
         # Refill the device cache with the current top-k after hit and miss
         # copies complete, so the next step can reuse these entries.
         with torch.npu.stream(self._materialize_refill_stream):
-            _wait_stream_event(self._materialize_refill_stream, self.hit_done)
-            _wait_stream_event(self._materialize_refill_stream, self.miss_done)
+            _wait_stream_event(self._materialize_refill_stream, hit_done)
+            _wait_stream_event(self._materialize_refill_stream, miss_done)
             unidex_copy_inplace(
                 selected_kv_buffer,
                 self.device_kv_buffer[layer_idx],
@@ -821,7 +946,7 @@ class SparseKVCacheManager:
                 2,
                 block_dim=24,
             )
-            _record_stream_event(self._materialize_refill_stream, self.refill_done)
+            _record_stream_event(self._materialize_refill_stream, refill_done)
 
         # Replace the slot-map row with the current top-k mapping. Invalid
         # entries use the max_context_len sentinel column to preserve shape.
@@ -857,7 +982,7 @@ class SparseKVCacheManager:
                 1,
                 block_dim=48,
             )
-            _record_stream_event(self._materialize_slot_map_stream, self.slot_map_done)
+            _record_stream_event(self._materialize_slot_map_stream, slot_map_done)
 
 
 _global_sparse_kv_manager: Optional[SparseKVCacheManager] = None
