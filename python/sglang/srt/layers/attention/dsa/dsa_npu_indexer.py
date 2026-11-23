@@ -312,32 +312,42 @@ class DSANPUIndexerMixin:
             backend = get_attn_backend()
             if not is_prefill and getattr(backend, "use_fused_sparse_kv", False):
                 manager = backend.sparse_kv_manager
-                query = q.view(-1, self.n_heads, self.head_dim)
-                scales = {}
-                if getattr(manager, "packed_c8", False):
-                    query, query_scale = _quantize_npu_indexer_activation(
-                        query, pool.indexer_hadamard_128, pool.dtype
-                    )
-                    scales = {
-                        "query_scale": query_scale,
-                        "key_scale": pool.get_index_k_scale_buffer(layer_id),
-                    }
-                plan = manager.lim_adapter.select(
-                    manager,
-                    query=query,
-                    weights=weights,
-                    key=past_key_states,
-                    block_table=block_table,
-                    forward_batch=forward_batch,
-                    layer_id=layer_id,
-                    **scales,
+                packed_c8 = getattr(manager, "packed_c8", False)
+                local_layer = layer_id - manager.start_layer
+                # A C8 full/indexer layer without IndexShare consumers uses
+                # the same native indexer path as ordinary HBM DSA. Its LIM
+                # cache plan would have no consumer because attention routes
+                # directly through forward_sparse.
+                needs_lim_plan = not packed_c8 or manager.has_shared_consumers(
+                    local_layer
                 )
-                backend.forward_metadata.sparse_kv_lim_plan = plan
-                if getattr(manager, "packed_c8", False):
-                    manager.start_shared_prefetch(
-                        layer_id - manager.start_layer, forward_batch, plan
+                if needs_lim_plan:
+                    query = q.view(-1, self.n_heads, self.head_dim)
+                    scales = {}
+                    if packed_c8:
+                        query, query_scale = _quantize_npu_indexer_activation(
+                            query, pool.indexer_hadamard_128, pool.dtype
+                        )
+                        scales = {
+                            "query_scale": query_scale,
+                            "key_scale": pool.get_index_k_scale_buffer(layer_id),
+                        }
+                    plan = manager.lim_adapter.select(
+                        manager,
+                        query=query,
+                        weights=weights,
+                        key=past_key_states,
+                        block_table=block_table,
+                        forward_batch=forward_batch,
+                        layer_id=layer_id,
+                        **scales,
                     )
-                return plan.source_ids
+                    backend.forward_metadata.sparse_kv_lim_plan = plan
+                    if packed_c8:
+                        manager.start_shared_prefetch(
+                            local_layer, forward_batch, plan
+                        )
+                    return plan.source_ids
 
             if use_quant_indexer:
                 query, query_scale = _quantize_npu_indexer_activation(

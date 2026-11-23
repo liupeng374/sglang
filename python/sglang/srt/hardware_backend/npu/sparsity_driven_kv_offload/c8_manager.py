@@ -133,6 +133,12 @@ class C8SparseKVCacheManager(FusedSparseKVCacheManager):
         if self.shared_kv_prefetch is not None:
             self.shared_kv_prefetch.start_anchor(anchor, forward_batch, plan)
 
+    def has_shared_consumers(self, anchor):
+        return bool(
+            self.shared_kv_prefetch is not None
+            and self.shared_kv_prefetch.groups.get(anchor)
+        )
+
     def _init_host_pool(self):
         self.host_pool = self.mf_host_pool = PackedMemFabricKVPool(
             tokens=self.host_token_capacity,
