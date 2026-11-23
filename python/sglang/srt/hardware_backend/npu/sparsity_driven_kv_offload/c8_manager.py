@@ -9,6 +9,7 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_budget imp
 )
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_lim import (
     LIMDecodeAdapter,
+    LIMSelection,
     sparse_query_width,
 )
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_manager import (
