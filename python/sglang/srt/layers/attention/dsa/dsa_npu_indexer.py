@@ -333,6 +333,10 @@ class DSANPUIndexerMixin:
                     **scales,
                 )
                 backend.forward_metadata.sparse_kv_lim_plan = plan
+                if getattr(manager, "packed_c8", False):
+                    manager.start_shared_prefetch(
+                        layer_id - manager.start_layer, forward_batch, plan
+                    )
                 return plan.source_ids
 
             if use_quant_indexer:

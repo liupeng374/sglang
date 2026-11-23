@@ -215,6 +215,15 @@ def get_sparse_kv_budget(
             graph_batch_capacity = get_cuda_graph_max_batch_size(resident_rows)
             if decode is not None and decode.bs:
                 graph_batch_capacity = min(max(decode.bs), graph_batch_capacity)
+    shared_index_layers = None
+    if kv_dtype == torch.float8_e4m3fn:
+        hf_config = model_config.hf_text_config
+        layer_count = getattr(hf_config, "num_hidden_layers", num_layers)
+        if layer_count == num_layers and is_deepseek_dsa(hf_config):
+            shared_index_layers = [
+                dsa_layer_skips_topk(hf_config, layer_id)
+                for layer_id in range(num_layers)
+            ]
     return resolve_sparse_kv_budget(
         model_config=model_config,
         page_size=page_size,
@@ -230,6 +239,7 @@ def get_sparse_kv_budget(
         prefill_workspace_tokens=prefill_rows * aligned_context,
         max_query_width=get_sparse_kv_max_query_width(),
         copy_sfa_query_heads=copy_sfa_query_heads,
+        shared_index_layers=shared_index_layers,
         graph_batch_capacity=max(
             resident_rows,
             graph_batch_capacity,

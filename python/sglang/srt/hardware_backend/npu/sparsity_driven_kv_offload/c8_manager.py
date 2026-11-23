@@ -119,6 +119,20 @@ class C8SparseKVCacheManager(FusedSparseKVCacheManager):
     def _make_decode_adapter(self):
         return C8DecodeAdapter(self)
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.shared_kv_prefetch = None
+        if any(self.budget.shared_index_layers):
+            from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.c8_resident import (
+                RollingC8SharedPrefetch,
+            )
+
+            self.shared_kv_prefetch = RollingC8SharedPrefetch(self)
+
+    def start_shared_prefetch(self, anchor, forward_batch, plan):
+        if self.shared_kv_prefetch is not None:
+            self.shared_kv_prefetch.start_anchor(anchor, forward_batch, plan)
+
     def _init_host_pool(self):
         self.host_pool = self.mf_host_pool = PackedMemFabricKVPool(
             tokens=self.host_token_capacity,
@@ -225,6 +239,13 @@ class C8SparseKVCacheManager(FusedSparseKVCacheManager):
 
     def copy_sfa_attention(self, layer, query_nope, query_rope, plan, current_inputs):
         layer_index = layer.layer_id - self.start_layer
+        if (
+            self.shared_kv_prefetch is not None
+            and layer_index in self.shared_kv_prefetch.layer_to_anchor
+        ):
+            raise RuntimeError(
+                "C8 shared layers require the rolling shared-attention entry point."
+            )
         batch, width = plan.valid_rows.numel(), plan.query_width
         rows, heads = batch * width, query_nope.shape[1]
         padded_heads = self.budget.copy_sfa_query_heads
@@ -272,3 +293,18 @@ class C8SparseKVCacheManager(FusedSparseKVCacheManager):
         valid = plan.valid_rows[:, None].expand(batch, width).reshape(rows)
         output.masked_fill_(~valid[:, None, None], 0)
         return output[:, :heads].reshape(rows, -1)
+
+    def copy_shared_sfa_attention(
+        self, layer, query_nope, query_rope, plan, current_inputs, forward_batch
+    ):
+        if self.shared_kv_prefetch is None:
+            raise RuntimeError("C8 shared prefetch is not initialized.")
+        return self.shared_kv_prefetch.attention(
+            layer.layer_id - self.start_layer,
+            query_nope,
+            query_rope,
+            layer,
+            forward_batch,
+            plan,
+            current_inputs,
+        )

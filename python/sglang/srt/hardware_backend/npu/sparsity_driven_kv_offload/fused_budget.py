@@ -64,6 +64,7 @@ class BudgetPlan:
         prefill_workspace_tokens: int = 0,
         resident_rows: int | None = None,
         packed_c8: bool = False,
+        shared_index_layers: list[bool] | None = None,
     ) -> None:
         resident_rows = request_rows if resident_rows is None else resident_rows
         if not 1 <= resident_rows <= request_rows:
@@ -83,6 +84,11 @@ class BudgetPlan:
         self.index_head_dim = index_head_dim
         self.kv_cache_dim = kv_lora_rank + qk_rope_head_dim
         self.prefill_workspace_tokens = prefill_workspace_tokens
+        self.shared_index_layers = list(shared_index_layers or [False] * num_layers)
+        if len(self.shared_index_layers) != num_layers:
+            raise ValueError(
+                "Shared-index layer pattern must match the KV pool layer count."
+            )
         metadata_dtype = torch.int32
         self.manager_buffers = {
             "device_kv_buffer": BufferSpec(
@@ -120,6 +126,16 @@ class BudgetPlan:
             self.manager_buffers["slot_to_source"] = BufferSpec(
                 (resident_rows + 1, cache_tokens + 1), metadata_dtype, num_layers
             )
+            # One compact packed-KV workspace is reused as the shared-layer
+            # group advances. Only one layer's selected rows are live at a time.
+            shared_prefetch = any(self.shared_index_layers)
+            self.prefetch_spec = BufferSpec(
+                (batch_capacity * max_query_width * top_k, 1, C8_ROW_BYTES),
+                torch.int8,
+                1 if shared_prefetch else 0,
+            )
+        else:
+            self.prefetch_spec = BufferSpec((0,), torch.int8)
         if resident_rows < request_rows:
             self.manager_buffers["request_to_resident"] = BufferSpec(
                 (request_rows,), metadata_dtype
@@ -175,6 +191,7 @@ class BudgetPlan:
             (batch_capacity * max_query_width, copy_sfa_query_heads, kv_lora_rank),
             torch.bfloat16 if packed_c8 else kv_dtype,
         ).nbytes
+        self.prefetch_bytes = self.prefetch_spec.nbytes
         self.copy_sfa_bytes = sum(
             s.nbytes
             for n, s in self.manager_buffers.items()
@@ -199,6 +216,7 @@ class BudgetPlan:
             + self.output_scratch_bytes
             + self.prefill_workspace_bytes
             + self.adapter_bytes
+            + self.prefetch_bytes
         )
 
     @property
@@ -266,6 +284,7 @@ def resolve_sparse_kv_budget(
     graph_batch_capacity: int = 0,
     prefill_workspace_tokens: int = 0,
     resident_rows: int | None = None,
+    shared_index_layers: list[bool] | None = None,
 ) -> BudgetPlan:
     """Resolve and validate native persistent allocations before pool sizing."""
     kv_lora_rank = model_config.kv_lora_rank
@@ -319,6 +338,7 @@ def resolve_sparse_kv_budget(
         qk_rope_head_dim=qk_rope_head_dim,
         index_head_dim=index_head_dim,
         packed_c8=packed_c8,
+        shared_index_layers=shared_index_layers,
     )
     base = BudgetPlan(**plan_options)
     workspace_bytes = sum(

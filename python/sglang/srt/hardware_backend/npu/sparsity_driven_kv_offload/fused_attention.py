@@ -35,6 +35,22 @@ def forward_fused_sparse_kv_offload(
     if not is_prefill:
         plan = backend.forward_metadata.sparse_kv_lim_plan
         rows = forward_batch.batch_size * plan.query_width
+        layer_index = layer.layer_id - manager.start_layer
+        if (
+            getattr(manager, "shared_kv_prefetch", None) is not None
+            and layer_index in manager.shared_kv_prefetch.layer_to_anchor
+        ):
+            result = manager.copy_shared_sfa_attention(
+                layer,
+                q[:rows].view(rows, -1, backend.kv_lora_rank),
+                q_rope[:rows].view(rows, -1, backend.qk_rope_head_dim),
+                plan,
+                current_inputs,
+                forward_batch,
+            )
+            if q.shape[0] > rows:
+                return torch.nn.functional.pad(result, (0, 0, 0, q.shape[0] - rows))
+            return result
         result = manager.copy_sfa_attention(
             layer,
             q[:rows].view(rows, -1, backend.kv_lora_rank),
