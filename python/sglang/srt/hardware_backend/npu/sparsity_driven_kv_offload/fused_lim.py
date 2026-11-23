@@ -22,11 +22,11 @@ def sparse_query_width(forward_batch):
 @dataclass
 class LIMSelection:
     source_ids: torch.Tensor
-    device_slots: torch.Tensor
-    topk_misses: torch.Tensor
-    miss_sources: torch.Tensor
-    miss_slots: torch.Tensor
-    miss_counts: torch.Tensor
+    device_slots: torch.Tensor | None
+    topk_misses: torch.Tensor | None
+    miss_sources: torch.Tensor | None
+    miss_slots: torch.Tensor | None
+    miss_counts: torch.Tensor | None
     sparse_rows: torch.Tensor
     valid_rows: torch.Tensor
     request_safe_slots: torch.Tensor

@@ -111,23 +111,19 @@ class BudgetPlan:
             ),
         }
         if packed_c8:
-            if resident_rows <= 1:
-                raise ValueError("A5 C8 requires at least one live resident row.")
-            self.manager_buffers["device_kv_buffer"] = BufferSpec(
-                (resident_rows - 1, cache_tokens, 1, C8_ROW_BYTES),
-                torch.int8,
-                num_layers,
-            )
-            del self.manager_buffers["device_rope_buffer"]
-            # The final column is a write sink for inactive planner lanes.
-            self.manager_buffers["device_slot_map"] = BufferSpec(
-                (resident_rows + 1, context_len + 1), metadata_dtype, num_layers
-            )
-            self.manager_buffers["slot_to_source"] = BufferSpec(
-                (resident_rows + 1, cache_tokens + 1), metadata_dtype, num_layers
-            )
-            # One compact packed-KV workspace is reused as the shared-layer
-            # group advances. Only one layer's selected rows are live at a time.
+            # C8 shared attention copies the full selected TopK into one
+            # rolling workspace and runs QSFA from it. No per-layer sparse HBM
+            # cache or LIM miss/slot map is needed on this path.
+            for name in (
+                "device_kv_buffer",
+                "device_rope_buffer",
+                "device_slot_map",
+                "resident_begin",
+                "resident_end",
+                "planner_hbm_block_table",
+            ):
+                del self.manager_buffers[name]
+            self.manager_buffers.pop("slot_to_source", None)
             shared_prefetch = any(self.shared_index_layers)
             self.prefetch_spec = BufferSpec(
                 (batch_capacity * max_query_width * top_k, 1, C8_ROW_BYTES),
@@ -180,17 +176,34 @@ class BudgetPlan:
             self.adapter_buffers[name] = BufferSpec((batch_capacity,), metadata_dtype)
         for name in ("_pre_sparse", "_pre_valid"):
             self.adapter_buffers[name] = BufferSpec((batch_capacity,), torch.bool)
+        if packed_c8:
+            # C8's rolling shared path does not consume CopySFA's per-token
+            # device slots or host-miss lists.
+            for name in (
+                "device_slots",
+                "topk_misses",
+                "miss_sources",
+                "miss_slots",
+                "miss_counts",
+            ):
+                del self.adapter_buffers[name]
         self.device_kv_bytes = sum(
             spec.nbytes
             for name, spec in self.manager_buffers.items()
             if name in ("device_kv_buffer", "device_rope_buffer")
         )
-        self.slot_map_bytes = self.manager_buffers["device_slot_map"].nbytes
-        # Reserve one maximal forward output without allocating it persistently.
-        self.output_scratch_bytes = BufferSpec(
-            (batch_capacity * max_query_width, copy_sfa_query_heads, kv_lora_rank),
-            torch.bfloat16 if packed_c8 else kv_dtype,
+        self.slot_map_bytes = self.manager_buffers.get(
+            "device_slot_map", BufferSpec((0,), metadata_dtype)
         ).nbytes
+        # Reserve one maximal forward output without allocating it persistently.
+        self.output_scratch_bytes = (
+            0
+            if packed_c8
+            else BufferSpec(
+                (batch_capacity * max_query_width, copy_sfa_query_heads, kv_lora_rank),
+                kv_dtype,
+            ).nbytes
+        )
         self.prefetch_bytes = self.prefetch_spec.nbytes
         self.copy_sfa_bytes = sum(
             s.nbytes

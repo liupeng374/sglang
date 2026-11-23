@@ -1,4 +1,4 @@
-"""Target decode/verify always consumes native LIM plans with CopySFA."""
+"""Target decode/verify consumes native LIM plans and backend-specific SFA."""
 
 from __future__ import annotations
 
