@@ -209,6 +209,67 @@ class FusedSparseKVCacheManager:
 
         return LIMDecodeAdapter(self)
 
+    def load_back_dense_layers(self, req_pool_idx: int, seq_len: int) -> None:
+        """After PD transfer, copy dense layers' KV from host_pool to k_buffer.
+
+        Dense (indexer) layers need their KV in the HBM compact k_buffer for
+        forward_sparse.  Both host_pool and k_buffer share the same paged
+        layout and page indices (from req_to_token), so source and
+        destination row indices are identical.  The host pool layout differs
+        between the split (CKV + KPE) and packed-C8 policies; detect the
+        active layout via ``packed_c8``.
+        """
+        dense_indices = getattr(self.paged_kv_cache, "dense_layer_indices", [])
+        if not dense_indices or self.host_pool is None:
+            return
+
+        rows = (
+            self.req_to_token_pool.req_to_token[req_pool_idx][:seq_len]
+            .to(torch.int64)
+            .contiguous()
+        )
+        valid = torch.ones(
+            rows.shape[0], dtype=torch.bool, device=self.device
+        )
+
+        packed = getattr(self, "packed_c8", False)
+        for dense_layer_idx in sorted(dense_indices):
+            buf_slot = self.paged_kv_cache.dense_layer_buffer_map[
+                dense_layer_idx
+            ]
+            if packed:
+                # C8 packed: single int8 component; PackedMemFabricKVPool
+                # accepts exactly one source/destination pair per call.
+                self.host_pool.copy_rows(
+                    sources=(self.host_kv_buffer[dense_layer_idx],),
+                    destinations=(self.paged_kv_cache.k_buffer[buf_slot],),
+                    source_rows=rows,
+                    destination_rows=rows,
+                    valid=valid,
+                )
+            else:
+                # Split layout: separate CKV and KPE components.
+                self.host_pool.copy_rows(
+                    sources=(
+                        self.host_k_buffer[dense_layer_idx],
+                        self.host_v_buffer[dense_layer_idx],
+                    ),
+                    destinations=(
+                        self.paged_kv_cache.k_buffer[buf_slot],
+                        self.paged_kv_cache.v_buffer[buf_slot],
+                    ),
+                    source_rows=rows,
+                    destination_rows=rows,
+                    valid=valid,
+                )
+        logger.debug(
+            "%s PD load_back: req_pool_idx=%d seq_len=%d dense_layers=%d",
+            "A5 C8" if packed else "Fused",
+            req_pool_idx,
+            seq_len,
+            len(dense_indices),
+        )
+
     def _raise_buffer_allocation_error(
         self,
         buffer_name: str,

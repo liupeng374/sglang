@@ -3171,6 +3171,21 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
 
         self._commit_hicache_local_restore_to_req(decode_req)
 
+        # A5 C8 PD: after transfer, dense (indexer) layers' KV sits in the
+        # host_pool (A5PackedMFPool) but forward_sparse reads from the HBM
+        # compact k_buffer.  Copy dense layers back to HBM before the request
+        # enters the running queue.  The sparse manager (e.g.
+        # C8SparseKVCacheManager) is attached to the paged KV pool by the
+        # attention backend; non-C8 backends have no such method.
+        sparse_mgr = getattr(self.token_to_kv_pool, "sparse_kv_manager", None)
+        if sparse_mgr is not None and hasattr(
+            sparse_mgr, "load_back_dense_layers"
+        ):
+            fill_len = pre_alloc_fill_len(decode_req.req)
+            sparse_mgr.load_back_dense_layers(
+                decode_req.req.kv.req_pool_idx, fill_len
+            )
+
         # Case 3: Success - commit the transfer
         # A rebootstrap resumes from its last output id, already committed; the
         # prefill's sampled token is dropped.

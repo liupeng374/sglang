@@ -2217,6 +2217,21 @@ class KVCacheConfigurator:
         use_dsa_fp8_kv_cache_storage = (
             self.kv_cache_dtype == torch.float8_e4m3fn and is_arch35
         )
+
+        # When sparsity-driven KV offload is enabled, full indexer layers
+        # (skip_topk == False) keep their MLA KV in the HBM paged pool.
+        # Compute the set of local layer indices that need HBM KV buffers.
+        dense_layer_indices = None
+        if is_dsa_model and envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.get():
+            dense_layer_indices = [
+                local_idx
+                for local_idx in range(self.layer_info.num_effective_layers)
+                if not dsa_layer_skips_topk(
+                    self.model_config.hf_config,
+                    self.layer_info.start_layer + local_idx,
+                )
+            ]
+
         token_to_kv_pool = NPUMLATokenToKVPool(
             max_total_num_tokens,
             page_size=get_schedule().page_size,
@@ -2242,6 +2257,7 @@ class KVCacheConfigurator:
             end_layer=self.layer_info.end_layer,
             use_combined_kv_buffer=self.use_combined_kv_buffer,
             modelslim_cache_layout=self.modelslim_cache_layout,
+            dense_layer_indices=dense_layer_indices,
         )
         return token_to_kv_pool
 

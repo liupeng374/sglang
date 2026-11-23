@@ -50,6 +50,8 @@ class RollingC8SharedPrefetch:
         )
         self.ready = torch.npu.Event()
         self.pending = None
+        self._cached_sources = None
+        self._cached_historical = None
 
     def start_anchor(self, anchor, batch, plan):
         group = self.groups.get(anchor, ())
@@ -62,6 +64,8 @@ class RollingC8SharedPrefetch:
             positions = batch.positions[: plan.source_ids.shape[0]].reshape(
                 batch.batch_size, plan.query_width
             )
+            self._cached_sources = None
+            self._cached_historical = None
             self._prefetch(group[0], batch, plan.source_ids, positions)
 
     def _prefetch(self, layer, batch, topk, positions):
@@ -80,15 +84,21 @@ class RollingC8SharedPrefetch:
         for tensor in (topk, positions, batch.seq_lens, batch.req_pool_indices):
             tensor.record_stream(self.stream)
         with torch.npu.stream(self.stream):
-            historical, _ = selection_masks(
-                topk, positions, batch.seq_lens, batch.req_pool_indices, manager.size
-            )
-            requests = (
-                batch.req_pool_indices[:, None, None]
-                .expand(-1, width, count)
-                .reshape(rows, count)
-            )
-            sources = manager.host_source_indices(requests, topk).reshape(-1)
+            if self._cached_sources is None:
+                historical, _ = selection_masks(
+                    topk, positions, batch.seq_lens, batch.req_pool_indices, manager.size
+                )
+                requests = (
+                    batch.req_pool_indices[:, None, None]
+                    .expand(-1, width, count)
+                    .reshape(rows, count)
+                )
+                sources = manager.host_source_indices(requests, topk).reshape(-1)
+                self._cached_sources = sources
+                self._cached_historical = historical
+            else:
+                historical = self._cached_historical
+                sources = self._cached_sources
             destinations = torch.arange(
                 rows * count, dtype=torch.long, device=topk.device
             )

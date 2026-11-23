@@ -146,6 +146,7 @@ def get_sparsity_driven_kv_offload_cell_size(
     start_layer: int = 0,
     is_draft_worker: bool = False,
     indexer_layer_ids: Optional[Sequence[int]] = None,
+    kv_cache_dtype: torch.dtype = torch.bfloat16,
 ) -> Optional[int]:
     if not is_sparsity_driven_kv_offload_enabled(
         model_config=model_config,
@@ -157,6 +158,13 @@ def get_sparsity_driven_kv_offload_cell_size(
     index_head_dim = get_sparsity_driven_kv_offload_index_head_dim(
         model_config=model_config
     )
+    # Full indexer layers (skip_topk == False) — computed once and reused for
+    # both the indexer K-cache layer count (elide branch) and the HBM KV
+    # sizing surcharge below.
+    num_dense_layers = sum(
+        not dsa_layer_skips_topk(model_config.hf_config, layer_id)
+        for layer_id in range(start_layer, start_layer + num_layers)
+    )
     if use_fused_sparse_kv_offload() and indexer_layer_ids is not None:
         num_indexer_layers = len(indexer_layer_ids)
     else:
@@ -165,13 +173,31 @@ def get_sparsity_driven_kv_offload_cell_size(
         )
 
         if _should_elide_dsa_index_k(is_draft_worker=is_draft_worker):
-            num_indexer_layers = sum(
-                not dsa_layer_skips_topk(model_config.hf_config, layer_id)
-                for layer_id in range(start_layer, start_layer + num_layers)
-            )
+            num_indexer_layers = num_dense_layers
         else:
             num_indexer_layers = num_layers
-    return index_head_dim * element_size * num_indexer_layers
+    # Indexer K cache cost (allocated for every indexer layer).
+    cell_size = index_head_dim * element_size * num_indexer_layers
+    # A5 FP8: each indexer layer also stores an FP32 scale per token.
+    if kv_cache_dtype == torch.float8_e4m3fn and num_indexer_layers > 0:
+        cell_size += 4 * num_indexer_layers
+
+    # Dense layers keep their main MLA KV in the HBM paged pool instead of
+    # offloading to Host.  Add their per-token KV cost so max_total_num_tokens
+    # is sized correctly.
+    if num_dense_layers > 0:
+        # Use calculate_mla_kv_cache_dim so A5 FP8's packed row width
+        # (FP8 NoPE + FP32 scales + BF16 RoPE) is accounted for correctly.
+        from sglang.srt.mem_cache.kv_cache_configurator import (
+            calculate_mla_kv_cache_dim,
+        )
+
+        mla_kv_dim = calculate_mla_kv_cache_dim(
+            model_config=model_config, kv_cache_dtype=kv_cache_dtype
+        )
+        cell_size += mla_kv_dim * num_dense_layers * element_size
+
+    return cell_size
 
 
 def get_sparse_kv_budget(

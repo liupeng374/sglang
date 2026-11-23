@@ -1,4 +1,4 @@
-from typing import TYPE_CHECKING, Optional, Sequence
+from typing import TYPE_CHECKING, List, Optional, Sequence
 
 import torch
 
@@ -652,6 +652,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         is_draft_worker: bool = False,
         use_combined_kv_buffer: bool = False,
         modelslim_cache_layout=None,
+        dense_layer_indices: Optional[List[int]] = None,
     ):
         # MLAPO historically owned NZ writes. Keep the allocation unchanged and
         # write into the NZ-addressed view below so ordinary MLA (including
@@ -765,8 +766,47 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             # The padded slot 0 is used for writing dummy outputs from padded tokens.
             if self.enable_sparsity_driven_kv_offload:
-                self.k_buffer = None
-                self.v_buffer = None
+                # Full indexer layers (skip_topk == False) keep their MLA KV in
+                # the HBM paged pool; shared layers offload to Host.  Only
+                # allocate HBM KV buffers for the dense layers.
+                self.dense_layer_indices = sorted(
+                    set(dense_layer_indices) if dense_layer_indices else set()
+                )
+                self.dense_layer_buffer_map = {
+                    local_idx: buf_slot
+                    for buf_slot, local_idx in enumerate(self.dense_layer_indices)
+                }
+                num_dense = len(self.dense_layer_indices)
+                if num_dense > 0:
+                    self.k_buffer = torch.zeros(
+                        (
+                            num_dense,
+                            self.size // self.page_size + self.kv_page_padding,
+                            self.page_size,
+                            1,
+                            self.kv_cache_dim,
+                        ),
+                        dtype=self.store_dtype,
+                        device=self.device,
+                    )
+                    self.v_buffer = torch.zeros(
+                        (
+                            num_dense,
+                            self.size // self.page_size + self.kv_page_padding,
+                            self.page_size,
+                            1,
+                            self.kr_cache_dim,
+                        ),
+                        dtype=(
+                            torch.bfloat16
+                            if self.dsa_kv_cache_store_fp8
+                            else self.rope_dtype
+                        ),
+                        device=self.device,
+                    )
+                else:
+                    self.k_buffer = None
+                    self.v_buffer = None
             elif self.use_combined_kv_buffer:
                 self.kv_buffer = torch.zeros(
                     (
@@ -809,6 +849,13 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                     ),
                     device=self.device,
                 )
+            # Non-offload path: every layer has a full HBM KV buffer, so the
+            # dense map is the identity mapping.
+            if not self.enable_sparsity_driven_kv_offload:
+                self.dense_layer_indices = list(range(layer_num))
+                self.dense_layer_buffer_map = {
+                    local_idx: local_idx for local_idx in range(layer_num)
+                }
             self.index_k_buffer = None
             if self.index_head_dim is not None:
                 # index_size, not self.size: the indexer is replicated.
@@ -962,16 +1009,19 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
         self._raise_if_native_kv_cache_disabled()
+        local_layer = layer_id - self.start_layer
+        buf_slot = self.dense_layer_buffer_map[local_layer]
         return (
-            self.k_buffer[layer_id - self.start_layer],
-            self.v_buffer[layer_id - self.start_layer],
+            self.k_buffer[buf_slot],
+            self.v_buffer[buf_slot],
         )
 
     def get_combined_kv_buffer(self, layer_id: int):
         """Return combined MLA latent/RoPE cache: [pages, page_size, 1, dim]."""
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
-        return self.kv_buffer[layer_id - self.start_layer]
+        buf_slot = self.dense_layer_buffer_map[layer_id - self.start_layer]
+        return self.kv_buffer[buf_slot]
 
     def _clear_buffers(self):
         if self.use_combined_kv_buffer:
@@ -993,19 +1043,21 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
         self._raise_if_native_kv_cache_disabled()
+        buf_slot = self.dense_layer_buffer_map[layer_id - self.start_layer]
 
         if self.store_dtype != self.dtype:
-            return self.k_buffer[layer_id - self.start_layer].view(self.dtype)
-        return self.k_buffer[layer_id - self.start_layer]
+            return self.k_buffer[buf_slot].view(self.dtype)
+        return self.k_buffer[buf_slot]
 
     def get_value_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
         self._raise_if_native_kv_cache_disabled()
+        buf_slot = self.dense_layer_buffer_map[layer_id - self.start_layer]
 
         if self.store_dtype != self.dtype:
-            return self.v_buffer[layer_id - self.start_layer].view(self.dtype)
-        return self.v_buffer[layer_id - self.start_layer]
+            return self.v_buffer[buf_slot].view(self.dtype)
+        return self.v_buffer[buf_slot]
 
     def get_index_k_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
@@ -1120,6 +1172,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         loc, _, _ = unwrap_write_loc(loc_info)
         self._raise_if_native_kv_cache_disabled()
         layer_id = layer.layer_id
+        buf_slot = self.dense_layer_buffer_map[layer_id - self.start_layer]
         if self.dsa_kv_cache_store_fp8:
             if cache_v is None:
                 cache_k, cache_v = cache_k.split(
@@ -1127,7 +1180,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 )
             packed = self._pack_dsa_fp8_kv_cache(cache_k, cache_v)
             torch_npu.npu_scatter_nd_update_(
-                self.k_buffer[layer_id - self.start_layer].view(
+                self.k_buffer[buf_slot].view(
                     -1, 1, self.kv_cache_dim
                 ),
                 loc.view(-1, 1),
@@ -1168,12 +1221,12 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             return
 
         torch_npu.npu_scatter_nd_update_(
-            self.k_buffer[layer_id - self.start_layer].view(-1, 1, self.kv_lora_rank),
+            self.k_buffer[buf_slot].view(-1, 1, self.kv_lora_rank),
             loc.view(-1, 1),
             cache_k.view(-1, 1, self.kv_lora_rank),
         )
         torch_npu.npu_scatter_nd_update_(
-            self.v_buffer[layer_id - self.start_layer].view(
+            self.v_buffer[buf_slot].view(
                 -1, 1, self.qk_rope_head_dim
             ),
             loc.view(-1, 1),
@@ -1203,7 +1256,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             src = values.contiguous().view(-1, num_tiles, tile_size).view(-1, tile_size)
             torch_npu.npu_scatter_nd_update_(dst, indices, src)
 
-        offset = layer_id - self.start_layer
+        offset = self.dense_layer_buffer_map[layer_id - self.start_layer]
         scatter(self.k_buffer[offset], cache_k, self.kv_lora_rank)
         scatter(self.v_buffer[offset], cache_v, self.qk_rope_head_dim)
 
@@ -1263,11 +1316,17 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         return out
 
     def _get_cpu_offload_layer_buffers(self, local_layer_id):
-        # flatten(page, slot) also works for the zero-width packed V placeholder.
-        buffers = [
-            self.k_buffer[local_layer_id].flatten(0, 1),
-            self.v_buffer[local_layer_id].flatten(0, 1),
-        ]
+        # Shared layers in the sparsity-driven offload path have no HBM KV
+        # buffer; their KV lives in Host via SparseKVCacheManager.  Return
+        # None placeholders so get_cpu_copy / load_cpu_copy skip them.
+        buf_slot = self.dense_layer_buffer_map.get(local_layer_id)
+        if buf_slot is None:
+            k_buf, v_buf = None, None
+        else:
+            # flatten(page, slot) also works for the zero-width packed V placeholder.
+            k_buf = self.k_buffer[buf_slot].flatten(0, 1)
+            v_buf = self.v_buffer[buf_slot].flatten(0, 1)
+        buffers = [k_buf, v_buf]
         slot = self.indexer_layer_id_to_slot.get(local_layer_id + self.start_layer)
         if slot is not None:
             buffers.append(self.index_k_buffer[slot].flatten(0, 1))

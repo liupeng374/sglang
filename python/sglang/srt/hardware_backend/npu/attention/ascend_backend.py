@@ -407,6 +407,7 @@ class AscendAttnBackend(AttentionBackend):
         self.use_fused_sparse_kv = (
             self.enable_sparsity_driven_kv_offload and use_fused_sparse_kv_offload()
         )
+        self.dense_layer_indices: set[int] = set()
         if self.enable_sparsity_driven_kv_offload:
             from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.manager import (
                 register_sparse_kv_manager,
@@ -414,6 +415,12 @@ class AscendAttnBackend(AttentionBackend):
 
             sparse_topk = get_sparsity_driven_kv_offload_sparse_context_len(
                 model_config=model_runner.model_config
+            )
+            paged_kv_cache_for_dense = (
+                model_runner.token_to_kv_pool_allocator.get_kvcache()
+            )
+            self.dense_layer_indices = set(
+                paged_kv_cache_for_dense.dense_layer_indices
             )
             if self.use_fused_sparse_kv:
                 self.sparse_kv_manager = getattr(
@@ -449,8 +456,10 @@ class AscendAttnBackend(AttentionBackend):
                 )
             register_sparse_kv_manager(self.sparse_kv_manager)
             logger.info(
-                "Sparsity-driven KV offload is enabled with manager %s.",
+                "Sparsity-driven KV offload is enabled with manager %s. "
+                "Dense (HBM KV) layer indices: %s",
                 self.sparse_kv_manager,
+                sorted(self.dense_layer_indices) if self.dense_layer_indices else "none",
             )
         else:
             self.sparse_kv_manager = None
@@ -2074,6 +2083,21 @@ class AscendAttnBackend(AttentionBackend):
             )
         if topk_indices is not None:
             if self.enable_sparsity_driven_kv_offload:
+                # Dense (indexer) layers keep KV in HBM paged pool and use
+                # forward_sparse regardless of manager type (standalone/fused/C8).
+                local_layer_idx = layer.layer_id - self.sparse_kv_manager.start_layer
+                if local_layer_idx in self.dense_layer_indices:
+                    return self.forward_sparse(
+                        q,
+                        k,
+                        v,
+                        layer,
+                        forward_batch,
+                        save_kv_cache,
+                        q_rope,
+                        k_rope,
+                        topk_indices,
+                    )
                 if self.use_fused_sparse_kv:
                     from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_attention import (
                         forward_fused_sparse_kv_offload as sparse_kv_attention,
@@ -3797,6 +3821,27 @@ class AscendAttnBackend(AttentionBackend):
                 save_kv_cache = False
         if topk_indices is not None:
             if self.enable_sparsity_driven_kv_offload:
+                # "full" indexer layers (skip_topk == False) keep their KV
+                # in the HBM paged pool and run sparse attention via
+                # forward_sparse, using the same npu_sparse_flash_attention
+                # operator as the HiSparse path — only the KV storage
+                # location differs.  This applies uniformly to all manager
+                # types (standalone, fused, C8).  "shared" layers
+                # (skip_topk == True) reuse the previous layer's topk_indices
+                # and continue to use the host-offload path.
+                local_layer_idx = layer.layer_id - self.sparse_kv_manager.start_layer
+                if local_layer_idx in self.dense_layer_indices:
+                    return self.forward_sparse(
+                        q,
+                        k,
+                        v,
+                        layer,
+                        forward_batch,
+                        save_kv_cache,
+                        q_rope,
+                        k_rope,
+                        topk_indices,
+                    )
                 if self.use_fused_sparse_kv:
                     from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_attention import (
                         forward_fused_sparse_kv_offload as sparse_kv_attention,
